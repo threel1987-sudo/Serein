@@ -1105,7 +1105,8 @@ class PersonaStateEngine:
             FROM persona_events
             WHERE profile_id = ?
             {session_clause}
-            ORDER BY id DESC
+            AND (error IS NULL OR error = '')
+            ORDER BY created_at DESC, id DESC
             LIMIT ?
             """,
             params,
@@ -1464,8 +1465,8 @@ class PersonaStateEngine:
             SELECT id, exchange_hash, event_type, perceived_intent,
                    surface_trigger, inner_thought, residue, created_at
             FROM persona_events
-            WHERE profile_id = ? AND session_id = ? AND error IS NULL
-            ORDER BY id DESC
+            WHERE profile_id = ? AND session_id = ? AND (error IS NULL OR error = '')
+            ORDER BY created_at DESC, id DESC
             LIMIT 1
             """,
             (self.profile_id, session_id),
