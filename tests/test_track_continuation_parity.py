@@ -309,6 +309,23 @@ def test_new_track_ordinal_uses_max_not_count_and_preserves_policy():
     assert assigned[0]['primary_track_id'] == 'session_current_track_0043' and ordinal == 44
 
 
+def test_status_only_update_reuses_existing_card_fields():
+    old = [card('session_current_track_0007', subject='Kept subject', throughline='Kept throughline',
+                event_policy='rolling_engineering', status='parked')]
+    messages = [{'id': 1, 'role': 'user', 'content': 'Continue', 'session_id': 1}]
+    output = {'message_assignments': [{'source_message_id': 1, 'primary_track_ref': old[0]['track_id'],
+                                       'context_track_refs': [], 'routing_role': 'origin'}],
+              'track_updates': [{'track_ref': old[0]['track_id'], 'status': 'active'}]}
+    _, updates, _ = normalize_event_track_message_output(output, messages, old, session_id='current', next_track_ordinal=8)
+    assert updates[0]['subject'] == 'Kept subject' and updates[0]['throughline'] == 'Kept throughline'
+    assert updates[0]['event_policy'] == 'rolling_engineering' and updates[0]['status'] == 'active'
+    # New tracks have no card to inherit from; full fields remain required.
+    output['message_assignments'][0]['primary_track_ref'] = 'new:1'
+    output['track_updates'][0]['track_ref'] = 'new:1'
+    with pytest.raises(ValueError, match='invalid fields'):
+        normalize_event_track_message_output(output, messages, old, session_id='current', next_track_ordinal=8)
+
+
 def test_previous_visible_window_boundaries_and_old_anchor_rehydration(settings):
     archive = raw_archive(settings)
     def add(session, number, workspace='one', metadata=None):

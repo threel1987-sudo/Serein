@@ -169,12 +169,27 @@ def normalize_event_track_message_output(
 
     update_by_ref: dict[str, dict[str, Any]] = {}
     for raw in raw_updates:
-        if not isinstance(raw, dict) or set(raw) not in (
+        if not isinstance(raw, dict):
+            raise ValueError("Track Router update has invalid fields")
+        track_ref = str(raw.get("track_ref") or "").strip()
+        if set(raw) == {"track_ref", "status"}:
+            # 已有 Track 的纯状态更新：模型常只想把 Track 标成 active/parked 而省略
+            # subject/throughline。沿用现有卡片的字段，不再整批打回重试；
+            # 新 Track（new:N）没有可沿用的卡片，仍要求完整字段。
+            card = existing.get(track_ref)
+            if card is None:
+                raise ValueError("Track Router update has invalid fields")
+            raw = {
+                "track_ref": track_ref,
+                "subject": card.get("subject"),
+                "throughline": card.get("throughline"),
+                "status": raw.get("status"),
+            }
+        elif set(raw) not in (
             {"track_ref", "subject", "throughline", "status"},
             {"track_ref", "subject", "throughline", "event_policy", "status"},
         ):
             raise ValueError("Track Router update has invalid fields")
-        track_ref = str(raw.get("track_ref") or "").strip()
         subject = " ".join(str(raw.get("subject") or "").split())
         throughline = " ".join(str(raw.get("throughline") or "").split())
         event_policy = str(raw.get("event_policy") or "").strip()
