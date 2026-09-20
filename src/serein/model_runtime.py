@@ -10,7 +10,14 @@ from .deployment import task_model
 
 class UpstreamError(ValueError):
     def __init__(self, response):
-        super().__init__(f'Upstream returned HTTP {response.status_code}')
+        message = f'Upstream returned HTTP {response.status_code}'
+        try:
+            detail = response.text.strip()
+        except Exception:
+            detail = ''
+        if detail:
+            message += ': ' + detail[:300]
+        super().__init__(message)
         self.response = response
 
 
