@@ -32,13 +32,21 @@ Scene、日记和批注工具按自用版的名称、参数和默认值提供。
 | 删除日记 | `delete_diary(diary_id)`；软删除，保留历史 |
 | 批注 | `annotate(memory_id, content, author='', role='assistant', annotation_id='')`；作者省略时使用实例 AI 名称，不改原文或证据 |
 
-以上工具不要求模型填写 `operation_id` 或数字版本号。Scene 编辑使用 `read_memory` 返回的 `document.updated_at`，在事务内检查冲突。日记修改在事务内读取和更新当前版本，保持自用版调用方式；不提供调用方跨请求的旧版本校验，写前应先读。锁定日记不可读正文、不可修订、评论或删除。日记没有收藏。
+以上工具不要求模型填写 `operation_id` 或数字版本号。Scene 编辑使用 `read_memory` 文本中的 `updated_at`，在事务内检查冲突。日记修改在事务内读取和更新当前版本，保持自用版调用方式；不提供调用方跨请求的旧版本校验，写前应先读。锁定日记不可读正文、不可修订、评论或删除。日记没有收藏。
 
 Scene 和日记的新建调用会独立创建内容；内部随机操作编号不等于跨请求自动去重。响应丢失时先读回确认，不要盲目重复保存。完整的 rc65 旧参数（包含 `operation_id`）仍通过内部兼容入口处理，保留旧重试回执和数字版本校验；新旧参数不能混用，兼容入口同样受工具白名单与只读权限约束。
 
 公开版附加的 `set_memory_state` 保留状态、浮现资格和收藏管理；Event 仅允许修改收藏。Scene 提案的 `propose_memory` / `review_memory` 与 Event 升 Scene 的独立可选工具仍保留自身的版本和回执契约。`save_memory` 已移除，旧白名单中的该名称映射到 `write_scene` / `edit_scene`。叙事卷仍由 `narrative_volume` 的 read → preview → save 流程书写，Event 正文由原话整理流水线维护。
 
-`index_sync` 重试已提交写入的索引同步；它不等同于配置页的“建立 / 补齐检索索引”。工具默认关闭，在设置 → 功能开启“索引重试”后才向模型和扩展 HTTP 接口提供；关闭不影响规范写入后的自动同步或后台 Index Worker。
+已提交写入的索引同步由规范写入路径、后台 Index Worker 和维护脚本负责，不向聊天模型提供手动重试工具。
+
+## 日记与暗房
+
+日记使用独立存储和工具，不进入普通 Scene／Event 自动召回，也没有收藏状态。网页和 `read_diary` 可以按编号、日期或最近条目读取；`write_diary`、`revise_diary`、`comment_diary`、`delete_diary` 分别新建、修订、评论和软删除。修订保留作者与历史，删除不会改写既有版本。日记可作为叙事卷材料；梦境在最近 48 小时没有新 Event／Scene 时，才回退读取新日记。
+
+`write_diary` 的 `unlock_at` 填未来时间时创建暗房日记。到期前读取只返回锁定状态，不返回正文；修订、评论和删除同样被拒绝。达到解锁时间后按普通日记读取，原始作者、日期、修订与评论继续保留。锁定由 Serein 的读取与写入接口执行，不改变数据库备份本身的访问权限。
+
+新建日记同样不提供跨请求幂等键；响应丢失时先按日期或最近条目读回确认。网页填写的日期与解锁时间按实例页面约定处理；接口调用应传明确的 ISO 时间与时区。
 
 ## 聊天指令接续
 
@@ -62,11 +70,15 @@ Scene 和日记的新建调用会独立创建内容；内部随机操作编号�
 
 ## 开关与名字
 
-`features.memos`、`persona`、`anti_retreat`、`window_shadows`、`association`、`relations_auto_accept`、`resume`、`originals`、`narrative_tools`、`index_sync_tool` 默认 false，写入实例数据库。备忘的界面名称统一为“备忘”，描述为“留给未来的话”。保存后后续请求直接读取，停止注入而不清空原有记录。
+`features.current_time`、`image_transcription_async`、`image_eyes`、`memos`、`persona`、`anti_retreat`、`window_shadows`、`association`、`write_context`、`relations_auto_accept`、`resume`、`originals`、`favorites`、`narrative_tools`、`event_to_scene` 默认 false，写入实例数据库。备忘的界面名称统一为“备忘”，描述为“留给未来的话”。保存后后续请求直接读取，停止调用或注入而不清空原有记录。自动摘要另由 `pipeline.auto_enabled` 控制；梦境由模型选择、每日概率和 Prompt 配置控制，不属于这组布尔开关。
+
+“异步图片转录”（`features.image_transcription_async`）与“眼睛”（`features.image_eyes`）只作用于经过 Serein 聊天网关的新图片消息，二者互斥，开启前必须选择 `assignments.image_transcription`。异步模式让原图照常进入主模型，回复完成后在后台转录并写回同一条 `raw_events` 原话，不注入当前聊天且不因转录失败阻塞回复。“眼睛”供不能识图的主模型使用：网关先保存原话和原图，由独立模型转录，随后把转录作为明确标注的来源材料注入聊天，并从发往主模型的消息中移除原图；失败会写入 failed 状态并在调用主模型前返回错误。两种模式的完成结果都绑定原话、图序和 SHA-256，写入同一原话行的专用状态、JSON 和更新时间列；关闭开关不删除已有转录，自动摘要仍可复用完成且字节匹配的结果。旧 `features.image_transcription=true` 自动迁移为“眼睛”。
 
 “联想”（`features.association`）是独立开关，位于设置 → 功能；保存后下一次召回生效，无需重启或重建索引。关闭时只走直接召回，不查询关系边或返回召回关联诊断列表，保留已有关系及其管理功能。直接候选前 6 条向量结果保底，第 7–20 条须达到已保存的整篇／片段门槛（默认 0.50）、cue 语义门槛（默认 0.55）、Event 特定关键词或带回忆意图的完整实体名之一；扩展信号各最多 3 条，只取得 reranker 资格，不加分。开启联想后，从直接 Scene 候选的已确认关系中最多再补一条 Scene，共用一次 reranker，仍须达到已保存的最终门槛（默认 0.65），最多两卡，选卡后冷却且不补位。三个门槛保存后下一轮生效，无需重建向量；旧客户端只保存最终门槛时保留另外两项。联想不自动开启“关系提案自动通过”，自动通过也不自动开启联想；旧实例缺少此字段按关闭处理。
 
-备忘开启时注册 `memo_create`、`memo_list`、`memo_update`；窗影开启时只注册 `window_shadow_write`；开窗续接使用 `/resume` 指令；原话查阅开启时注册 `source_message_search`、`source_message_read`；索引重试开启时注册 `index_sync`。MCP 的 tools/list 和 tools/call 都重新核对开关，HTTP 同样处理关闭状态。客户端应刷新工具列表；即使缓存着旧列表，关闭的工具也不能调用。白名单继续限制可以出现的工具。
+“写入时找前情”（`features.write_context`）只在新 Scene 已经成功保存后运行一次辅助查找，最多返回一条可能相关的旧 Scene 和它可能所属的 Arc。结果是写入回执里的提示，不创建关系、不修改 Arc，也不影响刚刚完成的 Scene 写入；检索不可用或没有可靠线索时不返回提示。它与自动召回、联想和关系提案自动通过分别启停。
+
+备忘开启时注册 `memo_create`、`memo_list`、`memo_update`；窗影开启时只注册 `window_shadow_write`；开窗续接使用 `/resume` 指令；原话查阅开启时注册 `source_message_search`、`source_message_read`。MCP 的 tools/list 和 tools/call 都重新核对开关，HTTP 同样处理关闭状态。客户端应刷新工具列表；即使缓存着旧列表，关闭的工具也不能调用。白名单继续限制可以出现的工具。
 
 备忘独立于普通记忆召回，保留单次、每日、每 N 轮、晨晚时段和每天次数限制。聊天上游完整返回最终回复后才登记提醒；工具续轮或失败流不消耗提醒。心绪和防撤退共用“心绪/防撤退”模型（assignments.persona），功能开关独立。防撤退在完整回复结束后异步判断，不等待它才发送上游回复。信号仅供下一轮使用，过期或迟到不补发；同一窗口两次提示至少相隔 6 轮且 10 分钟，冷却与待提示内容持久化。检测失败不影响已返回的正文。关闭的功能不调用其模型。
 
@@ -76,7 +88,7 @@ Persona（`#persona`）和备忘（`#memos`）各有独立页面，导航始终�
 
 Persona 是只读的状态卡片展示页：当前心情、内心独白/余韵、情绪与关系状态、按窗口查看的变化记录。关系基调由聊天更新，不提供手填滑杆或保存按钮，也不提供人用 PUT 写入接口。读取页面不触发衰减或创建虚构窗口。空窗口不展示编造的情绪值。
 
-公开聊天宿主按旧仓库默认节奏每 3 个成功最终回复评估一次 Persona，每 15 轮检查最近净变化，达到阈值才带入轻提醒，不每轮注入完整状态。工具续轮沿用本轮原始用户问题；最近对话转换为评估器需要的完整问答。备忘工具与页面共用存储，创建工具补齐开始/结束、重复、间隔及次数上限，默认每 6 轮且每天最多一次（早晚默认两次）。带入模型的备忘含 memo_id，便于明确标完成。
+公开聊天宿主按旧仓库默认节奏每 3 个成功最终回复评估一次 Persona，但评估结果只保存并供心绪页面展示，不注入后续聊天。防撤退保持独立，判断命中后按冷却规则在下一轮带入一次提示。工具续轮沿用本轮原始用户问题；最近对话转换为评估器需要的完整问答。备忘工具与页面共用存储，创建工具补齐开始/结束、重复、间隔及次数上限，默认每 6 轮且每天最多一次（早晚默认两次）。带入模型的备忘含 memo_id，便于明确标完成。
 
 备忘按旧版使用方式提供起止时间、每隔几轮/每日/早晚/单次、每日与总次数上限、间隔分钟、通道范围。页面移除“会话”、“稍后 30 分钟”及“下次出现”，支持编辑、标完成、归档和重新打开。底层 next_due_at 仍供提醒调度使用，不显示为手填选项；编辑其他字段时保留既有调度时间和会话约束；页面新建默认为全局。重新打开保留累计次数和有效期。单纯编辑正文不重置每日提醒计数。每日上限留空时，创建按原存储默认值（早晚 2，其他 1），编辑保留原值。列表最多显示 200 条，人用管理 API 为经认证的 `/v1/companion`，与随开关注册的 AI 工具分开。归档可恢复，不作永久删除。
 
@@ -86,7 +98,7 @@ Persona 是只读的状态卡片展示页：当前心情、内心独白/余韵�
 
 ## 开窗续接、关联与导出
 
-“当前日期时间”（`features.current_time`）默认关闭。开启后，聊天网关会在每个新用户轮次的动态上下文中注入 `clock.timezone` 对应的日期、时间、UTC 偏移和 IANA 时区名；默认时区为 `Asia/Shanghai`，可在功能设置中更改。同一轮的工具续轮复用首次注入的时间，不重新取时。该上下文不进入原始聊天归档、召回查询、Writer、打标或关系提案。
+“当前日期时间”（`features.current_time`）默认关闭。开启后，聊天网关会在每个新用户轮次正文末尾附加 `clock.timezone` 对应的日期、时间、UTC 偏移和 IANA 时区名，位置等同客户端在用户正文后附带的当前时间；默认时区为 `Asia/Shanghai`，可在功能设置中更改。同一轮的工具续轮复用首次注入的时间，不重新取时。该上下文不进入原始聊天归档、召回查询、Writer、打标或关系提案。
 
 聊天 API 未提供窗口标识时使用默认会话 `main`；显式 `serein.window_id`、`X-Serein-Window-ID` 或旧 `X-Ombre-Session-Id` 可区分会话。不填或全局固定值会共用轮次与冷却，不会因此识别新窗口或自动调用 resume。客户端填写说明见使用说明与 [模型接入](model-settings.md)。
 
@@ -104,7 +116,7 @@ Persona 是只读的状态卡片展示页：当前心情、内心独白/余韵�
 
 材料编号目录包含已绑定、可读取的上传材料（upload）；仅提及、明确排除或不可读取的材料不进入编号目录。编号 0 是叙事卷正文，其余编号从当前目录复制，不能用材料总数代替编号。上传材料只在显式读取时返回正文。
 
-公开版 MCP `read_arc_materials` 每次完整返回最多4000 UTF-16单位（包含转义与content包装）。小结果保留原字段并附带 `has_more=false`；长结果使用 `page_format=json_fragment` 分片约定，将各页 `content` 按 `content_offset` 拼接，到 `content_complete=true` 才得到完整 JSON 结果。保持所有查询参数不变，把 `next_cursor` 传入 `cursor`，读至 `has_more=false`；正文、来源 ID 和元数据均完整保留，不额外返回重复的 structuredContent。每页重新核对当前读取权限、内容和查询条件；变更后旧游标失效，应刷新目录重新读。`offset/limit` 仍按材料条数分页，读完当前结果的全部分片后才使用 `next_offset`，并清空 cursor。HTTP 与内部读取接口保持原有返回格式。
+公开版 MCP 的 `read_memory`、`recall_memory`、`find_arc`、`read_arc_materials`、`read_diary` 和 `read_favorites` 统一只返回一个可读文本块，不附 `structuredContent`，也不再复制一份 JSON 字符串。文本按适用范围包含类型、状态、ID、标题、日期／时间、版本、更新时间、作者、正文、评论／批注、绑定原文的 source_id 与原消息编号，以及叙事卷材料菜单。Event 没有评论时明确显示 0；`with_evidence=true` 才展开绑定原文正文。`read_arc_materials` 继续用 `offset/limit` 按材料条数分页；超出客户端单次长度时返回纯文本 `[text_page]` 分片，保持选择参数不变并传回 `next_cursor`，按 `content_offset` 拼接 `text:` 后的内容。HTTP 与 UI 使用的内部读取接口保持结构化返回，不受 MCP 展示格式影响。
 
 `/resume` 在服务内部读取并合并全部接续资料后一次性交给模型，模型无需逐页调用工具。内部分页不改变完整注入行为；Arc 材料工具的分页用于独立的显式材料查阅。
 
@@ -122,7 +134,7 @@ Persona 是只读的状态卡片展示页：当前心情、内心独白/余韵�
 
 ## 原话 → Event
 
-三个角色依次为 Track Router → Curator → Event Writer。Curator 决定 admission、边界与原文 ownership，并逐图转录；Writer 使用完整 owned 原文、原图及有边界的上下文写作，并保留自检。独立原话证据整理已撤掉，原话来源绑定与哈希仍由宿主保存。
+三个角色依次为 Track Router → Curator → Event Writer。Curator 决定 admission、边界与原文 ownership，并逐图转录；Writer 使用完整 owned 原文、图片转录与可见画面描述及有边界的上下文写作，并保留自检。独立原话证据整理已撤掉，原话来源绑定与哈希仍由宿主保存。
 
 白天在同一 session 累计至少五个已完成回复包，并从最后一条可回应消息起满足二十分钟会话静默后，只做归线；不同 session 不合计。助手的普通回复或主动消息都会重新开启回应窗口。未获回应的使用者提问和主动消息不凑轮数；主动消息得到使用者首条回复后，连同随后属于该次交互的落点整体只算一个回复包。连续多条未获回应的主动消息仍是一个待回应包，但最近一条会继续后移静默截止。持续对话不会因为较早五包已满二十分钟而提前处理；中途真实停顿满二十分钟时，停顿前的完整段可以先处理。二十分钟只用于 flush 和粗分传输批次，不是语义切分，也不会替代 Track Router。
 
@@ -132,11 +144,11 @@ Persona 是只读的状态卡片展示页：当前心情、内心独白/余韵�
 
 rolling_engineering 只合并仍服务同一建设主线的全部相关 active leaves；不强迫选同 Track 的所有旧 Event，不相关的唯一旧条目也不阻止 create。命中 protected/manual/forked/blocked/scene_ref/narrative_ref 时，host 把拟议替换转成 defer。旧原文与新原文由 host 取 exact union，并继承来源角色；Writer 读取完整前版正文及其 owned 原文，防止逐次合并丢掉早期内容。上下文不会因此获得证据所有权。
 
-Writer 正文不设固定字数上下限，短经历写清即止，较长或多次合并的经历优先保留关键经过、因果与结果，不逐轮复述；保留自检与至多两轮结构／证据纠错，不重新切分。Writer 自检和图片转录保存到 pipeline_event_details；原文证据由现有 Event 事务绑定，保留活动叶、指纹、来源集合、引用保护与幂等收据。Scene 仍由聊天里的 agent 主动写，自动 Event 不进入 Bridge 信箱，也不生成 scene_candidate 或创建关系边。
+Writer 正文以 1000 字为写作硬上限而非目标，短经历写清即止，不凑字；较长或多次合并的经历优先保留不可替代的原话锚点、关键经过、因果与结果，不逐轮复述。host 以 1500 字作为模型计数误差的容错阈值，超过时进入纠错，程序不截断正文；保留自检与至多两轮结构／证据纠错，不重新切分。Writer 自检和图片转录保存到 pipeline_event_details；原文证据由现有 Event 事务绑定，保留活动叶、指纹、来源集合、引用保护与幂等收据。Scene 仍由聊天里的 agent 主动写，自动 Event 不进入 Bridge 信箱，也不生成 scene_candidate 或创建关系边。
 
 设置 → 功能中的“Event 升为 Scene”（features.event_to_scene）默认关闭。保存后即时启停工具；关闭后拒绝旧客户端继续调用，保留已有 Event 和 Scene。可写实例开启后的 `promote_event_to_scene` 供主窗口在读过 Event 及当前绑定原话后，提交自己编辑的标题和正文。工具核对 Event 当前版本，以新 ID 保存 Scene，沿用 Event 的全部有效原话绑定，并记录来源 Event ID、版本和正文哈希；Event 原件不改写。Scene 覆盖全部原话后，原 Event 停止自动浮现；已有修订箱待处理提示中涉及该 Event 的项撤出，后续扫描也跳过它，Scene 仍按自己的材料资格参与扫描。重复操作 ID 返回原回执；另一操作再次转换同一 Event 会报冲突，后续修改应编辑已生成的 Scene。
 
-宿主改为公开版数据库和模型 API：只处理显式导入或归档的原话。Track 卡不设时间 TTL；归线默认读取同一 source、同一 runtime／workspace 边界下当前及前一个可见会话的 Track。再次使用的卡随当前窗口前移；未使用的卡留在最后实际出现的窗口，超出两窗口可见范围后不再参与 Router，但仍保存在库中。额外原文请求限定 declared Track / 可见会话 / 六个历史 unit，且仅一次。图片通过已归档的 URL / data URI 附给 Writer；不读取私有聊天宿主的图片目录，没有原图不能声称看过。各角色模型留空时，在设置页打开 Agent 配置弹窗，按说明接入后领取与提交任务；叙事卷 Writer 有独立 runner 引导。原先短版任务协议中尚未完成的任务保留为旧记录，新协议重新从未处理原话开始，已结算正文不重写。
+宿主改为公开版数据库和模型 API：只处理显式导入或归档的原话。Track 卡不设时间 TTL；归线默认读取同一 source、同一 runtime／workspace 边界下当前及前一个可见会话的 Track。再次使用的卡随当前窗口前移；未使用的卡留在最后实际出现的窗口，超出两窗口可见范围后不再参与 Router，但仍保存在库中。额外原文请求限定 declared Track / 可见会话 / 六个历史 unit，且仅一次。图片通过已归档的 URL / data URI 交给图片转录模型或 Curator；Writer 初写及修复只读已绑定的转录，不附原图。不读取私有聊天宿主的图片目录。各角色模型留空时，在设置页打开 Agent 配置弹窗，按说明接入后领取与提交任务；叙事卷 Writer 有独立 runner 引导。原先短版任务协议中尚未完成的任务保留为旧记录，新协议重新从未处理原话开始，已结算正文不重写。
 
 执行方式与配置见 [自动摘要](automatic-events.md)、[扩展接口](extensions.md)。
 

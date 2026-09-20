@@ -16,6 +16,7 @@ const reviewKeys = [
   "identity_correct",
 ];
 
+
 export function writerImageInputs(materials) {
   const receipts = [], unresolved = [];
   const add = (url, path) => {

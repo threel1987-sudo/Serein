@@ -23,7 +23,10 @@ test('gateway separates web auth from API auth, saves settings and streams respo
   const requests=[];
   const core=http.createServer((req,res)=>{
     if(req.url==='/health'){res.setHeader('Content-Type','application/json');res.end('{"status":"ok"}');return;}
-    requests.push({path:req.url,auth:req.headers.authorization,method:req.method,forwardedHost:req.headers['x-forwarded-host'],protocol:req.headers['mcp-protocol-version']});
+    requests.push({path:req.url,auth:req.headers.authorization,method:req.method,forwardedHost:req.headers['x-forwarded-host'],forwardedProto:req.headers['x-forwarded-proto'],protocol:req.headers['mcp-protocol-version']});
+    if(req.url.startsWith('/.well-known/oauth-') || ['/authorize','/token','/register'].includes(req.url)){
+      res.writeHead(req.url==='/register'?201:200,{'Content-Type':'application/json'});res.end('{"oauth":true}');return;
+    }
     if(req.headers.authorization!=='Bearer synthetic-api-key'){res.writeHead(401);res.end('{}');return;}
     if(req.url==='/api/hook/recall'){
       let raw='';req.on('data',chunk=>raw+=chunk);req.on('end',()=>{
@@ -36,13 +39,14 @@ test('gateway separates web auth from API auth, saves settings and streams respo
       if(req.url==='/diaries/999999'){res.statusCode=404;res.end('{"message":"Synthetic diary missing"}');return;}
       res.end('{"status":"deleted","recoverable":true}');return;
     }
-    if(['/api/fact-events/status','/api/fact-events/delete','/api/buckets/delete','/v1/tools/call'].includes(req.url)){
+    if(['/api/fact-events/status','/api/fact-events/delete','/api/buckets/delete','/v1/tools/call','/v1/pipeline/rebuild'].includes(req.url)){
       let raw='';req.on('data',chunk=>raw+=chunk);req.on('end',()=>{
         const body=JSON.parse(raw);requests.push({path:req.url,body});
         const payload=req.url==='/api/fact-events/status'
           ? {item:{item_id:body.item_id,item_type:'event',status:body.status}}
           : req.url==='/api/fact-events/delete' ? {deleted:1,item_type:'event',item_ids:[body.item_id]}
           : req.url==='/api/buckets/delete' ? {deleted:body.bucket_ids.length}
+          : req.url==='/v1/pipeline/rebuild' ? {status:'rebuilt',batch_id:body.batch_id}
           : {result:{status:'updated',updated_at:'synthetic-new-version'}};
         res.writeHead(200,{'Content-Type':'application/json'});res.end(JSON.stringify(payload));
       });return;
@@ -76,6 +80,7 @@ test('gateway separates web auth from API auth, saves settings and streams respo
   const child=spawn(process.execPath,['server/gateway.mjs'],{cwd:new URL('../',import.meta.url),stdio:['ignore','pipe','pipe'],env:{...process.env,
     SEREIN_MEMORY_URL:`http://127.0.0.1:${core.address().port}`,SEREIN_MEMORY_TOKEN_FILE:join(dir,'token'),
     SEREIN_WEB_AUTH_FILE:join(dir,'auth.json'),SEREIN_GATEWAY_PORT:String(port),SEREIN_GATEWAY_BIND:'127.0.0.1',SEREIN_PREVIEW_PORT:String(preview),
+    SEREIN_PUBLIC_ORIGIN:'https://memory.example',
     SEREIN_LEGACY_SOURCE_HOST:dir}});
   let output='';child.stdout.on('data',d=>output+=d);child.stderr.on('data',d=>output+=d);
   const base=`http://127.0.0.1:${port}`;
@@ -88,6 +93,11 @@ test('gateway separates web auth from API auth, saves settings and streams respo
     assert.ok(started,output);
     assert.equal((await fetch(base)).status,401);
     assert.equal((await fetch(base+'/ready')).status,200);
+    for(const [path,method] of [['/.well-known/oauth-protected-resource','GET'],['/.well-known/oauth-authorization-server','GET'],['/register','POST'],['/authorize','GET'],['/token','POST']]){
+      const response=await fetch(base+path,{method,headers:method==='POST'?{'Content-Type':'application/json'}:{},body:method==='POST'?'{}':undefined});
+      assert.ok([200,201].includes(response.status));
+      assert.ok(requests.some(r=>r.path===path&&r.method===method&&r.forwardedHost==='memory.example'&&r.forwardedProto==='https'));
+    }
     const auth={Authorization:basic('password-one')};
     const page=await fetch(base,{headers:auth});assert.equal(page.status,200);
     assert.ok(!(await page.text()).includes('synthetic-api-key'));
@@ -200,6 +210,11 @@ test('gateway separates web auth from API auth, saves settings and streams respo
     assert.equal((await fetch(base+'/__serein/pipeline/next',{method:'POST',headers:postHeaders,body:'{"include_recent":true}'})).status,200);
     assert.ok(requests.some(r=>r.path==='/v1/pipeline/next'&&r.method==='POST'));
     assert.equal((await fetch(base+'/__serein/pipeline/next',{method:'POST',headers:{...postHeaders,Origin:'https://foreign.invalid'},body:'{}'})).status,403);
+    const rebuildBody={batch_id:'pipeline:synthetic',confirm:'REBUILD_PIPELINE_BATCH'};
+    assert.equal((await fetch(base+'/__serein/pipeline/rebuild',{method:'POST',headers:postHeaders,body:JSON.stringify(rebuildBody)})).status,200);
+    assert.ok(requests.some(r=>r.path==='/v1/pipeline/rebuild'&&JSON.stringify(r.body)===JSON.stringify(rebuildBody)));
+    assert.equal((await fetch(base+'/__serein/pipeline/rebuild',{method:'POST',headers:{...postHeaders,Origin:'https://foreign.invalid'},body:JSON.stringify(rebuildBody)})).status,403);
+    assert.equal((await fetch(base+'/__serein/pipeline/rebuild',{headers:auth})).status,405);
     const upload='upload%3A'+'a'.repeat(64);
     for(const action of ['continue','pause'])assert.equal((await fetch(base+'/__serein/imports/'+upload+'/'+action,{method:'POST',headers:postHeaders,body:'{}'})).status,200);
     assert.equal((await fetch(base+'/v1/models',{headers:auth})).status,401);
@@ -218,7 +233,7 @@ test('gateway separates web auth from API auth, saves settings and streams respo
       for (const method of ['POST', 'GET', 'DELETE']) {
         const headers={Authorization:'Bearer synthetic-api-key','Content-Type':'application/json','Mcp-Protocol-Version':'2025-03-26',Origin:base};
         assert.equal((await fetch(base+path,{method,headers,body:method==='POST'?'{}':undefined})).status,200);
-        assert.ok(requests.some(r=>r.path===path&&r.method===method&&r.auth==='Bearer synthetic-api-key'&&r.forwardedHost===new URL(base).host&&r.protocol==='2025-03-26'));
+        assert.ok(requests.some(r=>r.path===path&&r.method===method&&r.auth==='Bearer synthetic-api-key'&&r.forwardedHost==='memory.example'&&r.forwardedProto==='https'&&r.protocol==='2025-03-26'));
       }
       assert.equal((await fetch(base+path,{method:'POST',headers:{Authorization:'Bearer synthetic-api-key',Origin:'https://foreign.invalid'},body:'{}'})).status,403);
     }

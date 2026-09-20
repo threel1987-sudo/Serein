@@ -61,7 +61,7 @@ def test_three_stages_and_writer_sees_exact_predecessor_originals(settings):
     task=asyncio.run(p.advance(settings.database,include_recent=True));prompt=task['request']['prompt']
     assert len(task['request']['messages'])==4
     assert task['role']=='event_writer' and 'Book club plan 1' in prompt and 'Book club plan 2' in prompt
-    assert '<previous_events_json>' in prompt and '正文上限' not in prompt
+    assert '<previous_events_json>' in prompt and '正文最多 1000 字，这是写作硬上限而非目标' in prompt
     with Store(settings.database) as store:
         detail=json.loads(store.conn.execute('SELECT details_json FROM pipeline_event_details').fetchone()[0])
         assert 'evidence' not in detail
@@ -81,15 +81,45 @@ def test_settled_event_is_queued_only_when_arc_linker_is_selected(settings):
         assert tuple(row)==(fact['item_id'],fact['fingerprint'],'pending')
 
 
-def test_native_bridge_writer_contract_has_no_fixed_body_limit():
+def test_writer_body_uses_1000_guidance_with_1500_tolerance():
     request={'messages':[{'id':1,'content':'A book was returned'}]}
     output=output_for('event_writer',request)
     output['event_draft']='书还了。'
     assert latest.validate_event_writer_result(output)==[]
-    output['event_draft']='书'*1200
+    output['event_draft']='书'*1500
     assert latest.validate_event_writer_result(output)==[]
+    output['event_draft']='书'*1501
+    assert '正文超过容错上限 1500 字：1501 字' in ' '.join(latest.validate_event_writer_result(output))
     output['title']=''
     assert '标题为空' in latest.validate_event_writer_result(output)
+
+
+def test_model_counting_tolerance_settles_without_truncation(settings):
+    ingest(settings)
+    curator=curator_task(settings)
+    p.submit(settings.database,curator['job_id'],output_for(curator['role'],curator['request']))
+    task=asyncio.run(p.advance(settings.database,include_recent=True))
+    output=output_for('event_writer',task['request'])
+    output['event_draft']='书'*1500
+    p.submit(settings.database,task['job_id'],output)
+    assert asyncio.run(p.advance(settings.database,include_recent=True))['events']==1
+    with Store(settings.database,read_only=True) as store:
+        saved=store.conn.execute('SELECT body FROM fact_events').fetchone()[0]
+        assert saved==output['event_draft'] and len(saved)==1500
+
+
+def test_writer_prompt_examples_match_both_evidence_outcomes():
+    prompt=latest.build_event_writer_prompt('2025-01-01','',[{'id':1,'role':'user','content':'A book was returned'}])
+    samples=[json.loads(line) for line in prompt.splitlines() if line.startswith('{"evidence_sufficient":')]
+    assert len(samples)==2
+    sufficient,insufficient=samples
+    for sample in samples:
+        assert latest.validate_event_writer_result(sample)==[]
+    sufficient['recallable']=False
+    assert latest.validate_event_writer_result(sufficient)==[]
+    assert insufficient['evidence_sufficient'] is False and insufficient['recallable'] is False
+    assert insufficient['title']==insufficient['event_draft']==''
+    assert insufficient['kept_details']==insufficient['discarded_details']==[]
 
 
 @pytest.mark.parametrize('accepted',[False,True])
@@ -154,8 +184,7 @@ def test_identity_rendering_never_rewrites_source_words(settings):
     with latest.identity_scope(names):
         prompt=latest.build_event_writer_prompt('2025-01-01','',[{'id':1,'role':'user','content':original}])
     assert original in prompt and 'Nori' in prompt and 'Atlas' in prompt and '{ai_name}' not in prompt
-    assert 'Nori想用封面颜色整理虚构的图书馆目录' in prompt
-    assert 'Nori在社区手作课做的蓝色纸风车' in prompt
+    assert 'Nori把台灯送修' in prompt
 
 
 def test_configured_names_are_literal_values_not_recursive_templates(settings):
@@ -169,10 +198,10 @@ def test_configured_names_are_literal_values_not_recursive_templates(settings):
     # Freshly loaded Writer examples use the current saved instance names.
     save_settings(settings.database, {'identity':{'user_name':'NewReader','ai_name':'NewGuide'}})
     rules=p.rules('event_writer',settings.database)
-    assert 'NewReader在社区手作课' in rules and 'NewGuide' in rules
+    assert 'NewReader把台灯送修' in rules and 'NewGuide' in rules
 
 
-def test_images_keep_ownership_and_are_attached_to_model_payload(settings,monkeypatch):
+def test_images_keep_ownership_and_only_curator_receives_pixels(settings,monkeypatch):
     uri='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aX1cAAAAASUVORK5CYII='
     raw_archive(settings).ingest([
         {'source_event_id':'u','session_id':'image','role':'user','text':'This is the book','created_at':'2025-01-01T00:00:00Z','metadata':{'attachments':[{'kind':'image','url':uri,'mime_type':'image/png'}]}},
@@ -180,9 +209,13 @@ def test_images_keep_ownership_and_are_attached_to_model_payload(settings,monkey
     save_settings(settings.database,{'models':[{'id':'local','model':'synthetic','base_url':'http://127.0.0.1:9/v1'}],'assignments':{r:'local' for r in p.ROLES}})
     async def complete(model,payload):
         with Store(settings.database,read_only=True) as store:request=json.loads(store.conn.execute('SELECT request_json FROM pipeline_jobs WHERE output_json IS NULL ORDER BY rowid DESC LIMIT 1').fetchone()[0])
-        if request['role']=='event_writer':
-            assert request['images'][0]['evidence_role']=='owned'
+        if request['role']=='event_curator':
+            assert request['images'][0]['evidence_role']=='stable'
             assert payload['messages'][1]['content'][1]['image_url']['url']==uri
+        if request['role']=='event_writer':
+            assert request['images']==[]
+            assert request['curator_image_transcriptions'][0]['evidence_role']=='owned'
+            assert isinstance(payload['messages'][1]['content'],str) and uri not in payload['messages'][1]['content']
         return {'choices':[{'message':{'content':json.dumps(output_for(request['role'],request))}}]}
     monkeypatch.setattr('serein.model_runtime.complete',complete)
     assert asyncio.run(p.advance(settings.database,include_recent=True))['events']==1

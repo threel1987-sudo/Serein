@@ -12,7 +12,7 @@ from .core.store import Store, encode, Conflict, now
 DEFAULT_IDENTITY = {'user_name': 'User', 'ai_name': 'AI'}
 DEFAULT_UPSTREAM = {'base_url': '', 'model': '', 'writer_model': '', 'api_key': '',
                     'writer_enabled': False, 'memory_enabled': False, 'operit_enabled': True}
-DEFAULT_FEATURES = {'memos':False, 'persona':False, 'anti_retreat':False, 'window_shadows':False, 'association':False, 'write_context':False, 'relations_auto_accept':False, 'resume':False, 'originals':False, 'favorites':False, 'narrative_tools':False, 'event_to_scene':False, 'index_sync_tool':False, 'current_time':False}
+DEFAULT_FEATURES = {'memos':False, 'persona':False, 'anti_retreat':False, 'window_shadows':False, 'association':False, 'write_context':False, 'relations_auto_accept':False, 'resume':False, 'originals':False, 'favorites':False, 'narrative_tools':False, 'narrative_nightly_organize':False, 'event_to_scene':False, 'current_time':False, 'image_transcription_async':False, 'image_eyes':False}
 DEFAULT_CLOCK = {'timezone':'Asia/Shanghai'}
 DEFAULT_RESUME = {'latest_shadow':True, 'recent_events':True, 'favorite_scenes':True, 'selected_memories':False, 'selected_ids':[],
                   'recent_originals':False, 'recent_original_limit':20, 'pending_originals':True}
@@ -26,16 +26,24 @@ DEFAULT_DOMAINS = [
     {'key':'general','label':'通用','description':'其他无法归入上述主域的经历','policy':'normal'},
 ]
 TASKS = ('chat', 'writer', 'embedding', 'reranker', 'relations', 'dreams', 'narrative_scout', 'event_pipeline',
-         'persona', 'anti_retreat', 'track_router', 'event_curator', 'event_writer', 'operit_tagging', 'arc_linker')
+         'persona', 'anti_retreat', 'track_router', 'image_transcription', 'event_curator', 'event_writer', 'operit_tagging', 'arc_linker')
 
 
 def read_from_store(store):
     row = store.conn.execute("SELECT value_json FROM background_state WHERE name='deployment_settings'").fetchone()
     saved = json.loads(row[0]) if row else {}
+    saved_features = saved.get('features', {})
+    features = {key:saved_features.get(key, value) for key,value in DEFAULT_FEATURES.items()}
+    # Preserve the old synchronous behavior as the new Eyes mode until the
+    # instance next saves its settings.
+    if ('image_transcription_async' not in saved_features and 'image_eyes' not in saved_features
+            and saved_features.get('image_transcription')):
+        features['image_eyes'] = True
     legacy_mode = 'legacy' if any(saved.get('assignments', {}).get(role) for role in ('track_router','event_curator','event_writer')) else 'agent'
     return {'settings_version':saved.get('settings_version',0), 'identity': {**DEFAULT_IDENTITY, **saved.get('identity', {})},
             'upstream': {**DEFAULT_UPSTREAM, **saved.get('upstream', {})},
-            'features': {**DEFAULT_FEATURES, **saved.get('features', {})},
+            # Retired feature keys in an older database must not revive removed tools.
+            'features': features,
             'clock': {**DEFAULT_CLOCK, **saved.get('clock', {})},
             'recall': saved.get('recall', {}),
             'resume': {key:saved.get('resume', {}).get(key, value) for key,value in DEFAULT_RESUME.items()},
@@ -43,7 +51,7 @@ def read_from_store(store):
             'tagging': saved.get('tagging', {'domains': DEFAULT_DOMAINS}),
             'tagging_version': saved.get('tagging_version', 1),
             'dream': {'main_prompt':'', 'daily_probability':0.4, **saved.get('dream', {})},
-            'pipeline': {'auto_enabled':True,'execution_mode':legacy_mode,'max_input_chars':12000,'max_prompt_chars':40000,'timeout_seconds':600, **saved.get('pipeline',{})},
+            'pipeline': {'auto_enabled':True,'execution_mode':legacy_mode,'max_input_chars':12000,'max_prompt_chars':40000,'timeout_seconds':600,'event_writer_concurrency':1, **saved.get('pipeline',{})},
             'assignments': {key:value for key,value in saved.get('assignments', {}).items() if key!='event_evidence'}}
 
 
@@ -171,6 +179,14 @@ def save_settings(database, changes):
             raise ValueError('Models in an upstream need distinct aliases; upstream names must distinguish their models')
         if any(value and value not in known for value in current['assignments'].values()):
             raise ValueError('A selected model is missing; clear its task assignment before removing it')
+        image_features = current['features']['image_transcription_async'], current['features']['image_eyes']
+        if all(image_features):
+            raise ValueError('“异步图片转录”和“眼睛”只能开启一个')
+        if any(image_features) and not current['assignments'].get('image_transcription'):
+            raise ValueError('开启图片转录或“眼睛”前，请先选择图片转录模型')
+        writer_concurrency=current['pipeline'].get('event_writer_concurrency',1)
+        if type(writer_concurrency) is not int or not 1<=writer_concurrency<=8:
+            raise ValueError('Event Writer concurrency must be an integer between 1 and 8')
         mode=current['pipeline']['execution_mode']
         if mode not in ('legacy','api','agent'):raise ValueError('Unknown Event execution mode')
         if mode=='api':

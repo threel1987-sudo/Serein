@@ -255,6 +255,9 @@ def prepare():
             print('请填 0.0.0.0 或 127.0.0.1。')
         port=port_prompt('网关端口',18217)
         private_file(DEPLOY/'.env',f'SEREIN_BIND={bind}\nSEREIN_PORT={port}\n')
+    values=read_env();saved_public_url=installation().get('public_url','')
+    if 'SEREIN_PUBLIC_ORIGIN' not in values and saved_public_url.startswith('https://'):
+        private_file(DEPLOY/'.env',''.join(f'{k}={v}\n' for k,v in {**values,'SEREIN_PUBLIC_ORIGIN':saved_public_url}.items()))
     record=installation()
     if backend()=='local' and 'memory_port' not in record:
         port=int(read_env()['SEREIN_PORT'])
@@ -398,7 +401,7 @@ def connection_guide():
     else:
         guide+=f'页面：{address}\n聊天 Base URL：{address}/v1\nMCP 地址：{address}/serein/mcp\n'
     guide+='API 密钥文件：deploy/secrets/api-token（不是页面密码）\n同机使用 127.0.0.1；手机连电脑填电脑的局域网 IP，并允许网关端口通过防火墙。\n公网入口可在主菜单 5 配置，页面密码和 API 鉴权保持启用。\n'
-    guide+='传输类型：Streamable HTTP\nMCP 请求头：Authorization: Bearer <上方 Gateway Key>（共用聊天 API Key，不是页面密码）\n'
+    guide+='传输类型：Streamable HTTP\nMCP OAuth：HTTPS 域名入口选择 OAuth，在 Serein 授权页输入上方 Gateway Key\nMCP 静态方式：Authorization: Bearer <上方 Gateway Key>（用于支持自定义请求头的客户端）\n'
     guide+='聊天经过此网关且开启“开窗续接”时，可发送 /resume 后面想继续聊的话；指令和接续材料由网关处理，不经过 MCP 工具返回。\n'
     guide+='在客户端添加请求头 X-Serein-Window-ID，值为当前会话 ID（例如 chat-001）；同一会话不变，新窗口换值。\n不填则使用默认会话 main，共用提醒轮次与召回冷却，不自动识别新窗口。固定值也不能区分窗口；开窗续接请在经过此网关的聊天中发送 /resume。\n'
     print(guide,end='')
@@ -455,16 +458,18 @@ def access():
         bind='0.0.0.0';public_url='';print('将开放网关端口 '+str(port)+'；请允许该端口通过服务器防火墙和云安全组。IP 入口使用 HTTP，公网长期使用建议选择 HTTPS。')
     else:bind='127.0.0.1';client_host='127.0.0.1';public_url=''
     if not confirm('应用此访问入口（保留数据、页面密码和 API 密钥）'):return
-    before=(DEPLOY/'.env').read_text();updated={**values,'SEREIN_BIND':bind}
+    oauth_origin=public_url if public_url else ''
+    before=(DEPLOY/'.env').read_text();updated={**values,'SEREIN_BIND':bind,'SEREIN_PUBLIC_ORIGIN':oauth_origin}
+    env_changed=values.get('SEREIN_BIND')!=bind or values.get('SEREIN_PUBLIC_ORIGIN','')!=oauth_origin
     try:
-        if values['SEREIN_BIND']!=bind:
+        if env_changed:
             private_file(DEPLOY/'.env',''.join(f'{k}={v}\n' for k,v in updated.items()))
             if backend()=='docker':compose('up','-d','--no-deps','--wait','gateway')
             else:local_action('restart','gateway')
         if proxy:helper.apply(*proxy,DEPLOY)
     except Exception:
         private_file(DEPLOY/'.env',before)
-        if values['SEREIN_BIND']!=bind:
+        if env_changed:
             if backend()=='docker':compose('up','-d','--no-deps','--wait','gateway')
             else:local_action('restart','gateway')
         raise
@@ -518,6 +523,19 @@ def repair_legacy_history():
     try:container_command(*args,'--apply',source=source)
     finally:service_action('up')
     print('补漏结束，请查看报告中的 ID 对应关系及待核对记录；同一备份可安全重跑。')
+
+
+def repair_legacy_cues():
+    if not (DEPLOY/'config.toml').is_file():raise ValueError('请先部署当前实例')
+    heading('旧 Scene 补 cues · 显式模型调用')
+    print('只处理已导入、仍活动且缺少 cues 的 Ombre Scene；保留正文、已有 cues 和已完成的主域／实体。')
+    print('失败项会保存进度并停止自动重试；再次执行会从缺失或失败项继续。')
+    container_command('repair-cues')
+    if not confirm('按以上预览补 cues（会调用打标模型并产生费用，执行前自动备份）'):return
+    service_action('stop')
+    try:container_command('repair-cues','--apply')
+    finally:service_action('up')
+    print('补 cues 已结束。已有 cues 未覆盖；空结果也会记为已处理，避免重复收费。')
 
 
 def restart():
@@ -583,7 +601,7 @@ def main():
         try:
             print(f'\n安装目录：{ROOT}\n实例数据：{DEPLOY / "runtime"}')
             choice=choose('Serein · 安装与维护',[
-                ('0','设置前端用户名／密码'),('1','拉取上游代码并重建' if (DEPLOY/'config.toml').is_file() else '安装 Serein（全新安装／旧库迁移）'),('2','重启服务'),('3','向量重建与清理'),('4','启动／停止／状态／日志'),('5','访问入口：本机／局域网／公网'),('6','更换 Gateway Key'),('7','网页旧库目录只读授权'),('8','旧边转换补救（早期版本未转换成功）'),('9','旧备份清理'),('10','历史数据补漏（梦境／窗影／日记／暗房）'),('q','退出')])
+                ('0','设置前端用户名／密码'),('1','拉取上游代码并重建' if (DEPLOY/'config.toml').is_file() else '安装 Serein（全新安装／旧库迁移）'),('2','重启服务'),('3','向量重建与清理'),('4','启动／停止／状态／日志'),('5','访问入口：本机／局域网／公网'),('6','更换 Gateway Key'),('7','网页旧库目录只读授权'),('8','旧边转换补救（早期版本未转换成功）'),('9','旧备份清理'),('10','历史数据补漏（梦境／窗影／日记／暗房）'),('11','旧 Scene 补 cues'),('q','退出')])
             if choice=='q':return
             spec=importlib.util.spec_from_file_location('installer_lock',ROOT/'src'/'serein'/'file_lock.py')
             locks=importlib.util.module_from_spec(spec);spec.loader.exec_module(locks)
@@ -597,7 +615,7 @@ def main():
                 else:
                     if select_environment() is False:continue
                     ensure_tools()
-                    {'1':deploy,'2':restart,'3':maintenance,'4':operations,'5':access,'6':rotate_key,'7':legacy_source_access,'8':repair_legacy_edges,'10':repair_legacy_history}[choice]()
+                    {'1':deploy,'2':restart,'3':maintenance,'4':operations,'5':access,'6':rotate_key,'7':legacy_source_access,'8':repair_legacy_edges,'10':repair_legacy_history,'11':repair_legacy_cues}[choice]()
         except EOFError:
             print('\n输入已结束，退出管理菜单。');return
         except KeyboardInterrupt:print('\n已取消当前操作。')

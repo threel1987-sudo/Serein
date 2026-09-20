@@ -184,8 +184,9 @@ class PipelinePatch(BaseModel):
     execution_mode: Literal['legacy','api','agent'] | None = None
     model_config = ConfigDict(extra='forbid')
     max_input_chars: int | None = Field(default=None,ge=2000,le=100000)
-    max_prompt_chars: int | None = Field(default=None,ge=8000,le=200000)
+    max_prompt_chars: int | None = Field(default=None,ge=8000,le=4000000)
     timeout_seconds: int | None = Field(default=None,ge=30,le=1800)
+    event_writer_concurrency: int | None = Field(default=None,ge=1,le=8,strict=True)
 
 
 class RecallPatch(BaseModel):
@@ -223,6 +224,11 @@ class SettingsPatch(BaseModel):
     @field_validator('features')
     @classmethod
     def known_features(cls, value):
+        if value and 'image_transcription' in value:
+            value = dict(value)
+            legacy = value.pop('image_transcription')
+            if 'image_transcription_async' not in value and 'image_eyes' not in value:
+                value['image_eyes'] = legacy
         if value and value.keys() - DEFAULT_FEATURES.keys():raise ValueError('Unknown optional feature')
         return value
 

@@ -65,10 +65,11 @@ def test_event_scene_switch_persists_and_refreshes_http_mcp(tmp_path, writable):
         assert services.read(event['id'])['document']['body_md'] == 'A trip'
 
 
-def test_index_sync_switch_refreshes_http_and_mcp(tmp_path):
-    database = tmp_path/'index-sync.db'
+def test_retired_index_sync_setting_does_not_restore_http_or_mcp_tool(tmp_path):
+    database = tmp_path/'retired-index-sync.db'
     with Store(database):
         pass
+    save_settings(database, {'features':{'index_sync_tool':True}})
     settings = Settings(database, writable=True)
     headers = {'Authorization':'Bearer test', 'Accept':'application/json, text/event-stream'}
     with TestClient(create_app(settings, token='test', live=True), headers=headers) as client:
@@ -81,21 +82,12 @@ def test_index_sync_switch_refreshes_http_and_mcp(tmp_path):
         def names():
             return {tool['name'] for tool in rpc('tools/list')['tools']}
 
-        def call():
-            return rpc('tools/call', {'name':'index_sync', 'arguments':{}})
-
         assert 'index_sync' not in names()
-        assert call()['isError']
+        assert rpc('tools/call', {'name':'index_sync', 'arguments':{}})['isError']
         assert client.post('/v1/extensions/index_sync', json={}).status_code == 404
         response = client.patch('/v1/settings', json={'features':{'index_sync_tool':True}})
-        assert response.status_code == 200, response.text
-        assert 'index_sync' in names()
-        assert call()['structuredContent'] == {'status':'current', 'updated':0}
-        assert client.post('/v1/extensions/index_sync', json={}).json() == {'status':'current', 'updated':0}
-        assert client.patch('/v1/settings', json={'features':{'index_sync_tool':False}}).status_code == 200
-        assert call()['isError']
-        assert client.post('/v1/extensions/index_sync', json={}).status_code == 404
-        assert 'index_sync' not in names()
+        assert response.status_code == 422
+        assert 'index_sync_tool' not in client.get('/v1/settings').json()['features']
 
 
 @pytest.mark.parametrize('writable', [False, True])
@@ -123,7 +115,9 @@ def test_http_mcp_auth_tools_and_single_lifecycle(tmp_path, monkeypatch, writabl
             for auth in ('', 'Bearer wrong', 'Basic synthetic-key'):
                 denied = client.post(path, headers={**headers, 'Authorization':auth}, json=initialize)
                 assert denied.status_code == 401
-                assert denied.headers['www-authenticate'] == 'Bearer'
+                challenge = denied.headers['www-authenticate']
+                assert challenge.startswith('Bearer resource_metadata="http://testserver/.well-known/oauth-protected-resource/')
+                assert 'scope="serein:mcp"' in challenge
             result = client.post(path, headers=headers, json=initialize)
             assert result.status_code == 200, result.text
             assert not result.history
@@ -148,7 +142,8 @@ def test_http_mcp_auth_tools_and_single_lifecycle(tmp_path, monkeypatch, writabl
             assert name not in names
             assert rpc('tools/call', {'name':name, 'arguments':{}})['isError']
         read = rpc('tools/call', {'name':'read_memory', 'arguments':{'identifier':'scene_test'}})
-        assert not read['isError'] and read['structuredContent']['document']['body_md'] == 'Original body'
+        assert not read['isError'] and 'structuredContent' not in read
+        assert 'body:\nOriginal body' in read['content'][0]['text']
         if writable:
             save_settings(settings.database, {'features':{'resume':True}})
             assert 'resume' not in {t['name'] for t in rpc('tools/list')['tools']}
@@ -164,19 +159,21 @@ def test_http_mcp_auth_tools_and_single_lifecycle(tmp_path, monkeypatch, writabl
             retry = rpc('tools/call', {'name':'write_scene', 'arguments':arguments})['structuredContent']
             assert saved['id'] == retry['id']
             reread = rpc('tools/call', {'name':'read_memory', 'arguments':{'identifier':saved['id']}})
-            assert reread['structuredContent']['document']['body_md'] == 'Saved over MCP'
-            assert reread['structuredContent']['document']['metadata']['scene_cues'] == ['synthetic']
-            assert reread['structuredContent']['document']['metadata']['date'] == '2026-09-14'
-            assert reread['structuredContent']['evidence'] == []
+            assert 'structuredContent' not in reread
+            assert 'body:\nSaved over MCP' in reread['content'][0]['text']
+            assert 'date: 2026-09-14' in reread['content'][0]['text']
+            assert 'bound_sources: 0' in reread['content'][0]['text']
             edit_args = {'operation_id':'http-mcp-edit', 'scene_id':saved['id'], 'expected_revision':1,
                          'content':'Edited over MCP'}
             edited = rpc('tools/call', {'name':'edit_scene', 'arguments':edit_args})['structuredContent']
             assert edited['revision'] == 2
             assert rpc('tools/call', {'name':'edit_scene', 'arguments':edit_args})['structuredContent']['revision'] == 2
             assert rpc('tools/call', {'name':'edit_scene', 'arguments':{**edit_args,'operation_id':'http-stale'}})['isError']
-            current = rpc('tools/call', {'name':'read_memory', 'arguments':{'identifier':saved['id']}})['structuredContent']['document']
-            assert current['body_md'] == 'Edited over MCP' and current['title'] == 'Synthetic'
-            assert current['metadata']['scene_cues'] == ['synthetic'] and current['metadata']['date'] == '2026-09-14'
+            current_text = rpc('tools/call', {'name':'read_memory', 'arguments':{'identifier':saved['id']}})['content'][0]['text']
+            assert 'title: Synthetic' in current_text and 'body:\nEdited over MCP' in current_text
+            with Store(settings.database, read_only=True) as store:
+                current = store.read(saved['id'])
+                assert current['metadata']['scene_cues'] == ['synthetic'] and current['metadata']['date'] == '2026-09-14'
             for kind in ('event', 'narrative'):
                 rejected = rpc('tools/call', {'name':'write_scene', 'arguments':{
                     **arguments, 'operation_id':'reject-'+kind, 'kind':kind}})
@@ -208,7 +205,8 @@ def test_official_streamable_http_client(tmp_path, entry_path):
                         assert 'read_memory' in {t.name for t in (await session.list_tools()).tools}
                         result = await session.call_tool('read_memory', {'identifier':'scene_sdk'})
                         assert not result.isError
-                        assert result.structuredContent['document']['body_md'] == 'Read by the official client'
+                        assert result.structuredContent is None
+                        assert 'body:\nRead by the official client' in result.content[0].text
     asyncio.run(exercise())
 
 

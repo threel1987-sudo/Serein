@@ -60,6 +60,8 @@ def test_stdio_mcp_write_read_recall_and_retry(tmp_path):
                 listing = await session.list_tools()
                 names = {tool.name for tool in listing.tools}
                 assert {"read_memory", "recall_memory", "write_scene", "edit_scene", "write_diary", "propose_memory"} <= names
+                for name in ('read_memory', 'recall_memory', 'find_arc', 'read_arc_materials', 'read_diary'):
+                    assert next(tool for tool in listing.tools if tool.name == name).outputSchema is None
                 assert 'update_evidence' not in names
                 assert not {"handoff", "breath", "resume_context"} & names
                 from serein.deployment import save_settings
@@ -78,11 +80,13 @@ def test_stdio_mcp_write_read_recall_and_retry(tmp_path):
                 again = await session.call_tool("write_scene", args)
                 assert again.structuredContent["id"] == document_id
                 readback = await session.call_tool("read_memory", {"identifier": document_id})
-                assert readback.structuredContent["evidence"] == []
-                assert readback.structuredContent['document']['metadata']['scene_cues'] == ['归航']
-                assert readback.structuredContent['document']['metadata']['date'] == '2026-09-14'
+                assert readback.structuredContent is None
+                assert f'id: scene:{document_id}' in readback.content[0].text
+                assert 'date: 2026-09-14' in readback.content[0].text
+                assert 'body:\n雨天归航' in readback.content[0].text
                 recalled = await session.call_tool("recall_memory", {"query": "归航"})
-                assert recalled.structuredContent["pools"]["scene"]["items"][0]["id"] == document_id
+                assert recalled.structuredContent is None
+                assert f'[typed_memory ref=scene:{document_id}]' in recalled.content[0].text
                 assert 'promote_event_to_scene' not in names
                 save_settings(database, {'features': {'event_to_scene': True}})
                 assert 'promote_event_to_scene' in {t.name for t in (await session.list_tools()).tools}
@@ -92,9 +96,10 @@ def test_stdio_mcp_write_read_recall_and_retry(tmp_path):
                 assert not promoted.isError
                 assert promoted.structuredContent['event_surface']['reasons'] == ['promoted_to_scene', 'covered_by_scene']
                 scene = await session.call_tool('read_memory', {'identifier':promoted.structuredContent['id']})
-                assert scene.structuredContent['evidence'] == []
+                assert scene.structuredContent is None and 'bound_sources: 1' in scene.content[0].text
+                assert '原文' not in scene.content[0].text
                 scene = await session.call_tool('read_memory', {'identifier':promoted.structuredContent['id'], 'with_evidence':True})
-                assert scene.structuredContent['evidence'][0]['content'] == '原文'
+                assert scene.structuredContent is None and 'text:\n原文' in scene.content[0].text
                 error = await session.call_tool("write_scene", {**args, "content": "changed"})
                 assert error.isError
                 save_settings(database,{'features':{'favorites':True}})
@@ -267,31 +272,12 @@ def test_promotion_optional_allowlist_can_start_disabled(tmp_path, selected):
     asyncio.run(exercise())
 
 
-@pytest.mark.parametrize('selected', [False, True])
-def test_index_sync_is_opt_in_and_respects_allowlist(tmp_path, selected):
-    from serein.deployment import save_settings
-    database = tmp_path/'index-sync-allowlist.db'
+def test_retired_index_sync_is_rejected_from_allowlist(tmp_path):
+    database = tmp_path/'retired-index-sync-allowlist.db'
     with Store(database):
         pass
-    server = create_server(Application(Settings(database, writable=True,
-        mcp_tools=['read_memory', *(['index_sync'] if selected else [])])))
-
-    async def exercise():
-        assert {t.name for t in await server.list_tools()} == {'read_memory'}
-        with pytest.raises(Exception, match='Unknown tool'):
-            await server.call_tool('index_sync', {})
-        save_settings(database, {'features':{'index_sync_tool':True}})
-        names = {t.name for t in await server.list_tools()}
-        assert ('index_sync' in names) is selected
-        if selected:
-            result = (await server.call_tool('index_sync', {}))[1]
-            assert result == {'status':'current', 'updated':0}
-        save_settings(database, {'features':{'index_sync_tool':False}})
-        assert {t.name for t in await server.list_tools()} == {'read_memory'}
-        with pytest.raises(Exception, match='Unknown tool'):
-            await server.call_tool('index_sync', {})
-
-    asyncio.run(exercise())
+    with pytest.raises(ValueError,match='unavailable'):
+        create_server(Application(Settings(database, writable=True,mcp_tools=['read_memory','index_sync'])))
 
 
 @pytest.mark.parametrize('configured,method', [(False,'lexical'), (True,'semantic')])

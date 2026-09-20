@@ -4,10 +4,23 @@ import {UpstreamSettings} from "./UpstreamSettings.jsx";
 import {upstreamModels,taskModelOptions} from "../modelOptions.js";
 import {AgentGuide} from './AgentGuide.jsx';
 import {RecallThresholdSettings} from './RecallThresholdSettings.jsx';
+import {upstreamsForSave} from '../upstreamSecrets.js';
 
 const tasks = {writer:"Narrative Writer",embedding:"Embedding",reranker:"Reranker",
   relations:"Scene 关系",dreams:"梦境",narrative_scout:"叙事卷找材料",persona:"心绪/防撤退",
-  track_router:"原话 · 归线",event_curator:"原话 · 切分与转录",event_writer:"原话 · Event 写作",operit_tagging:"打标",arc_linker:"Event · Arc 归档"};
+  track_router:"原话 · 归线",image_transcription:"图片转录 / 眼睛（聊天 / 自动摘要）",event_curator:"原话 · 切分",event_writer:"原话 · Event 写作",operit_tagging:"打标",arc_linker:"Event · Arc 归档"};
+
+const taskGroups = [
+  {key:"creation",title:"对话与创作",help:"陪伴状态、梦境和叙事内容使用的模型。",tasks:["writer","persona","dreams","narrative_scout"]},
+  {key:"retrieval",title:"记忆检索与整理",help:"负责检索、关系判断、打标和归档。",tasks:["embedding","reranker","relations","operit_tagging","arc_linker"]},
+  {key:"events",title:"原话自动摘要",help:"从原话归线、读图、切分，再写成 Event。",tasks:["image_transcription","track_router","event_curator","event_writer"]},
+];
+
+const taskLinks = {
+  image_transcription:{href:"https://www.agnes-ai.com/zh-Hans/docs/agnes-30-flash",label:"Agnes 3.0 Flash（暂时免费）"},
+  embedding:{href:"https://cloud.siliconflow.cn/i/NCXr2PLP",label:"硅基流动（邀请链接）"},
+  reranker:{href:"https://cloud.siliconflow.cn/i/NCXr2PLP",label:"硅基流动（邀请链接）"},
+};
 
 export function ModelSettings({page,summaryRequest=0,onOpenPipeline,onOpenCatalog,onOpenAssignments,
   recallThreshold,setRecallThreshold,candidateThresholdDraft,setCandidateThresholdDraft,
@@ -22,6 +35,7 @@ export function ModelSettings({page,summaryRequest=0,onOpenPipeline,onOpenCatalo
   const validCandidateThresholds=[bodyCandidateThreshold,cueCandidateThreshold].every(value=>
     value!=='' && Number.isFinite(Number(value)) && Number(value)>=0 && Number(value)<=1);
   const summaryConfig=useRef(null);
+  const upstreamForm=useRef(null);
   const ready=!!config;
   useEffect(()=>{
     if(!summaryRequest||!summaryConfig.current)return;
@@ -54,11 +68,7 @@ export function ModelSettings({page,summaryRequest=0,onOpenPipeline,onOpenCatalo
         if(!model.dimension)delete model.dimension;
         return model;
       });
-      const upstreams=(config.upstreams || []).map(({api_key_configured,clear_key,...upstream})=>{
-        if(clear_key){upstream.api_key="";upstream.api_key_env="";}
-        else if(!upstream.api_key)delete upstream.api_key;
-        return upstream;
-      });
+      const upstreams=upstreamsForSave(config.upstreams || [],upstreamForm.current);
       if(!validThreshold)throw new Error('召回阈值需填写 0 到 1 之间的数字。');
       if(!validCandidateThresholds)throw new Error('候选扩展门槛需填写 0 到 1 之间的数字。');
       if(passageMinChars===''||!Number.isInteger(Number(passageMinChars))||Number(passageMinChars)<1||Number(passageMinChars)>100000)
@@ -84,7 +94,7 @@ export function ModelSettings({page,summaryRequest=0,onOpenPipeline,onOpenCatalo
   return <>
     <div role="tabpanel" id="settings-content-models" aria-labelledby="settings-tab-models" aria-hidden={page!=="models"} inert={page!=="models"}>
       <section className="settings-group" aria-label="上游与模型">
-        {config&&<form onSubmit={save}>
+        {config&&<form ref={upstreamForm} onSubmit={save}>
       <div className="settings-group__heading"><h3>上游与模型</h3></div>
       <p className="model-connection-help">按上游管理模型，密钥只保存在服务端。</p>
       <UpstreamSettings modelIds={availableModels.map(m=>m.id)} assignments={config.assignments} upstreams={config.upstreams || []} onChange={changeUpstreams} onImported={setConfig} busy={busy} setBusy={setBusy} setStatus={setStatus} />
@@ -98,10 +108,14 @@ export function ModelSettings({page,summaryRequest=0,onOpenPipeline,onOpenCatalo
       <section className="settings-group" aria-label="各功能使用的模型">
         {config&&<form onSubmit={save}>
       <div className="settings-group__heading model-assignments-heading"><h3>功能使用的模型</h3><p>已选为向量或重排的模型不出现在聊天模型选项中，各功能可在此选择已配置的模型。留空的可选任务保持关闭。</p></div>
-      <div className="model-assignments">{Object.entries(tasks).map(([key,label])=><label className="settings-field" key={key}><span>{label}</span>
-        <select value={config.assignments[key] || ""} onChange={event=>setConfig(current=>({...current,assignments:{...current.assignments,[key]:event.target.value}}))}>
-          <option value="">未选择</option>{taskModelOptions(availableModels,config.assignments,key).map(model=><option key={model.id} value={model.id}>{model.upstream_name}/{model.label || model.model || "新模型"}</option>)}
-        </select></label>)}</div>
+      <div className="model-assignment-groups">{taskGroups.map(group=><section className="model-assignment-group" key={group.key} aria-labelledby={`model-group-${group.key}`}>
+        <div className="model-assignment-group__heading"><h4 id={`model-group-${group.key}`}>{group.title}</h4><p>{group.help}</p></div>
+        <div className="model-assignments">{group.tasks.map(key=>{const link=taskLinks[key];return <div className="settings-field model-assignment" key={key}>
+          <span><label htmlFor={`task-model-${key}`}>{tasks[key]}</label>{link&&<> · <a className="settings-link model-assignment__link" href={link.href} target="_blank" rel="noreferrer">{link.label}</a></>}</span>
+          <select id={`task-model-${key}`} aria-label={tasks[key]} value={config.assignments[key] || ""} onChange={event=>setConfig(current=>({...current,assignments:{...current.assignments,[key]:event.target.value}}))}>
+            <option value="">未选择</option>{taskModelOptions(availableModels,config.assignments,key).map(model=><option key={model.id} value={model.id}>{model.upstream_name}/{model.label || model.model || "新模型"}</option>)}
+          </select></div>})}</div>
+      </section>)}</div>
       <p className="model-connection-help">Event Writer 要核对原话、人物、因果和修订，再写出自然正文；建议为“原话 · Event 写作”选择理解和写作能力较强的模型。</p>
       <p className="model-connection-help">“打标”为事件和 Scene 补充主域大标签、提取有原文出处的实体，也为长记忆已有的 cues 绑定 passage。已有主域和正文保持不变；实体别名只留作建议。主域与短描述在地下室的“主域边界”管理。</p>
       <p className="model-connection-help">“Event · Arc 归档”为可选任务：先按 Event 正文中的关键词缩小已有 Arc，再让模型判断是否归入。它不读取聊天原话或叙事卷正文，不创建新 Arc；留空即关闭。</p>
@@ -134,9 +148,12 @@ export function ModelSettings({page,summaryRequest=0,onOpenPipeline,onOpenCatalo
       <p>自动摘要可能有遗漏或误解，重要内容请对照原始对话核对。</p>
       <label className="settings-field"><span>自动 Event 执行方式</span><select value={config.pipeline.execution_mode||'legacy'} onChange={event=>setConfig(current=>({...current,pipeline:{...current.pipeline,execution_mode:event.target.value}}))}>
         {(!config.pipeline.execution_mode||config.pipeline.execution_mode==='legacy')&&<option value="legacy">沿用旧配置（各阶段分别执行）</option>}<option value="api">API</option><option value="agent">Agent</option></select></label>
-      <p>{config.pipeline.execution_mode==='agent'?'通过已认证的 Agent 执行器领取任务。三阶段模型选择作为执行提示，执行器需按提示使用相应模型；仅切换此选项不会启动本机 CLI。':'在本页为归线、切分与转录、Event 写作分别选模型。切分与 Writer 所选 API 需支持图片和 JSON 输出。'}</p>
-      {Object.entries({max_input_chars:['每批原话字符上限',2000,100000],max_prompt_chars:['完整提示词字符上限',8000,200000],timeout_seconds:['模型读取超时（秒）',30,1800]}).map(([key,[label,min,max]])=>
+      <p>{config.pipeline.execution_mode==='agent'?'通过已认证的 Agent 执行器领取任务。阶段模型选择作为执行提示，执行器需按提示使用相应模型；仅切换此选项不会启动本机 CLI。':'在本页为归线、图片转录、切分、Event 写作分别选模型。选择独立图片转录模型后，切分器读取已落库的转录；不选择则仍由切分器直接读图。图片转录与 Writer 所选 API 需支持图片和 JSON 输出。'}</p>
+      {Object.entries({max_input_chars:['每批原话字符上限',2000,100000],max_prompt_chars:['完整提示词字符上限',8000,4000000],timeout_seconds:['模型读取超时（秒）',30,1800],event_writer_concurrency:['Event Writer 首轮并发数',1,8]}).map(([key,[label,min,max]])=>
         <label className="settings-field" key={key}><span>{label}</span><input type="number" min={min} max={max} value={config.pipeline[key]} onChange={event=>setConfig(current=>({...current,pipeline:{...current.pipeline,[key]:Number(event.target.value)}}))}/></label>)}
+      <small>“每批原话字符上限”是软目标：单个完整回复包本身更长时会独占一批，不截断原话。降低该值后，尚未结算且可进一步拆分的旧批次会在下次继续整理时按新值重批。</small>
+      <small>“完整提示词字符上限”是最终模型调用保护，可按所用模型上下文提高到 4000000；修改后下一次继续当前批次即可生效。</small>
+      <small>只并发 Curator 已冻结计划后的第一轮 Event Writer；Router、Curator、补读与最终结算保持串行。Agent 模式仍一次领取一个 Writer 任务。默认 1。</small>
       <button type="button" className="settings-link" onClick={onOpenPipeline}>查看整理进度与导入原话</button>
     </details>
           <AgentGuide label="配置 Agent 整理 Event" />

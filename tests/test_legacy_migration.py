@@ -13,6 +13,7 @@ from serein.deployment import read_settings, save_settings
 from serein.legacy_migration.scan import clean_body, is_daily_impression, is_old_self_anchor, scan, unpack
 from serein.legacy_migration.models import import_models
 from serein.legacy_migration.workflow import Migration, validate_cues
+from serein.legacy_migration.cues import preview as cue_preview, run as repair_cues
 from serein.legacy_migration.vectors import reuse_legacy, maintain
 
 
@@ -146,7 +147,7 @@ def test_archive_traversal_and_duplicate_rejected(tmp_path,setup):
     assert scan(root)['errors'][0]['error'].startswith('重复 id')
 
 
-def test_names_cues_entities_and_resume(setup,monkeypatch):
+def test_named_cues_are_dropped_without_retry_while_entities_are_saved(setup,monkeypatch):
     settings,_,plan,migration=setup;calls=[]
     migration.import_bodies()
     async def complete(model,payload):
@@ -160,22 +161,58 @@ def test_names_cues_entities_and_resume(setup,monkeypatch):
             entities=[{'name':'Mira','type':'person','supports':[{'source_id':material['source_id'],'quote':'Mira 约好周六去青禾书店。'}]}]
         return response({'domain':'life','entities':entities,'cues':['Mira 的书店约定'] if len(calls)==1 else ['周六书店约定']})
     monkeypatch.setattr('serein.legacy_migration.workflow.complete',complete)
-    with pytest.raises(ValueError,match='停止自动重试'):
-        asyncio.run(migration.tag_all())
-    assert len(calls)==1
     asyncio.run(migration.tag_all());asyncio.run(migration.tag_all())
-    assert len(calls)==3
-    assert '包含用户或 AI 名字' in calls[1]['validation_feedback']
-    assert 'validation_feedback' not in calls[0] and 'validation_feedback' not in calls[2]
+    assert len(calls)==2 and all('validation_feedback' not in call for call in calls)
     with Store(settings.database) as store:
         doc=store.read(migration.ids['a'])
-        assert doc['metadata']['scene_cues']==['周六书店约定']
+        assert doc['metadata']['scene_cues']==[]
         assert doc['metadata']['tagged_entities'][0]['name']=='Mira'
         assert doc['metadata']['canonical_domain']=='life'
         assert doc['revision']==2 and 'Mira' in doc['body_md']
     for cue in ['米拉的书店','SOL 的心事','User 的事情']:
-        with pytest.raises(ValueError):validate_cues([cue],['Mira','Sol','米拉'])
+        assert validate_cues([cue],['Mira','Sol','米拉'])==[]
+    assert validate_cues(['Mira 的书店','周六书店约定'],['Mira','Sol'])==['周六书店约定']
     assert validate_cues(['Airdrop 的使用'],['Mira','Sol'])==['Airdrop 的使用']
+
+
+def test_explicit_cue_repair_finishes_pending_and_preserves_completed_metadata(setup,monkeypatch):
+    settings,_,_,migration=setup;migration.import_bodies()
+    first=migration.ids['a'];second=migration.ids['b']
+    with Store(settings.database) as store,store.transaction():
+        doc=store.read(first)
+        store.revise(first,expected_revision=doc['revision'],title=doc['title'],body_md=doc['body_md'],metadata={
+            **doc['metadata'],'legacy_tagging_completed':True,'legacy_tagging_pending':False,
+            'tagged_entities':[{'name':'preserve-me'}]})
+    calls=[]
+    async def complete(model,payload):
+        calls.append(payload)
+        content=json.loads(payload['messages'][1]['content'])['content']
+        if payload['messages'][0]['content'].startswith('只返回 JSON'):
+            return response({'cues':['周六书店约定']})
+        assert 'materials' in json.loads(payload['messages'][1]['content'])
+        return response({'domain':'life','entities':[],'cues':['书店如约见面']})
+    monkeypatch.setattr('serein.legacy_migration.cues.complete',complete)
+    assert cue_preview(settings.database)['candidates']==2
+    result=asyncio.run(repair_cues(settings))
+    assert result['completed']==2 and result['cues_only']==1 and result['full_tagging']==1
+    with Store(settings.database) as store:
+        one=store.read(first);two=store.read(second)
+        assert one['metadata']['scene_cues']==['周六书店约定']
+        assert one['metadata']['tagged_entities']==[{'name':'preserve-me'}]
+        assert two['metadata']['scene_cues']==['书店如约见面']
+        assert two['metadata']['legacy_tagging_completed'] and not two['metadata']['legacy_tagging_pending']
+    assert cue_preview(settings.database)['candidates']==0
+
+
+def test_explicit_cue_repair_drops_named_cue_without_retry(setup,monkeypatch):
+    settings,_,_,migration=setup;migration.import_bodies();calls=[]
+    async def complete(model,payload):
+        data=json.loads(payload['messages'][1]['content']);calls.append(data)
+        return response({'domain':'life','entities':[],'cues':['Mira 的书店'] if len(calls)==1 else ['周六书店约定']})
+    monkeypatch.setattr('serein.legacy_migration.cues.complete',complete)
+    result=asyncio.run(repair_cues(settings))
+    assert len(calls)==2 and result['completed']==2 and result['empty']==1
+    assert all('validation_feedback' not in call for call in calls)
 
 
 def test_tagging_retry_errors_never_echo_arbitrary_provider_content():
@@ -228,7 +265,7 @@ def test_disable_cues_after_failure_keeps_successes_and_clears_cue_feedback(setu
     async def complete(model,payload):
         data=json.loads(payload['messages'][1]['content']);calls.append(data)
         if len(calls)==1:return response({'domain':'life','entities':[],'cues':['周六的书店约定']})
-        if len(calls)==2:return response({'domain':'life','entities':[],'cues':['Mira']})
+        if len(calls)==2:return response({'domain':'life','entities':[],'cues':'invalid'})
         assert 'validation_feedback' not in data and 'forbidden_names' not in data
         return response({'domain':'life','entities':[]})
     monkeypatch.setattr('serein.legacy_migration.workflow.complete',complete)

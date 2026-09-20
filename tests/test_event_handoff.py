@@ -6,7 +6,7 @@ from test_public_features import settings, ingest, output_for
 from serein.core.store import Store, Conflict
 from serein.deployment import save_settings, read_settings
 from serein.extensions import pipeline as p, pipeline_latest as latest
-from serein.extensions.pipeline_images import freeze_images, bind_transcriptions, verify_images
+from serein.extensions.pipeline_images import freeze_images, bind_transcriptions, verify_images, verify_transcriptions
 
 PNG='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aX1cAAAAASUVORK5CYII='
 
@@ -26,12 +26,12 @@ def test_three_stage_image_chain_preserves_bytes_transcription_and_raw_sources(s
     def check(request):
         role=request['role'];seen.append(role)
         assert role in ('track_router','event_curator','event_writer')
-        if role!='track_router':
+        if role=='event_curator':
             assert request['images'][0]['url']==PNG and request['images'][0]['sha256']==sha
             assert request['images'][0]['source_message_id']==1
             assert PNG not in request['prompt']
         if role=='event_writer':
-            assert request['images'][0]['evidence_role']=='owned'
+            assert request['images']==[] and request['image_input_mode']=='transcriptions_only'
             assert request['curator_image_transcriptions']==[{'source_message_id':1,'position':1,'sha256':sha,
                 'evidence_role':'owned','text':'Visible book title','unreadable':False}]
         return output_for(role,request)
@@ -39,9 +39,12 @@ def test_three_stage_image_chain_preserves_bytes_transcription_and_raw_sources(s
         assert mode=='api','Agent mode must not call the API'
         with Store(settings.database,read_only=True) as store:
             request=json.loads(store.conn.execute('SELECT request_json FROM pipeline_jobs WHERE output_json IS NULL ORDER BY rowid DESC LIMIT 1').fetchone()[0])
-        if request['role']!='track_router':assert payload['messages'][1]['content'][1]['image_url']['url']==PNG
+        if request['role']=='event_curator':assert payload['messages'][1]['content'][1]['image_url']['url']==PNG
+        if request['role']=='event_writer':
+            assert isinstance(payload['messages'][1]['content'],str) and PNG not in payload['messages'][1]['content']
         result=check(request)
-        if request['role']=='event_writer' and seen.count('event_writer')==1:result['event_draft']='字'*1200
+        if request['role']=='event_writer' and seen.count('event_writer')==1:
+            result['self_review']['result_preserved']=False
         return {'choices':[{'message':{'content':json.dumps(result)}}]}
     monkeypatch.setattr('serein.model_runtime.complete',complete)
     result=asyncio.run(p.advance(settings.database,include_recent=True))
@@ -52,13 +55,13 @@ def test_three_stage_image_chain_preserves_bytes_transcription_and_raw_sources(s
             p.submit(settings.database,result['job_id'],output)
             result=asyncio.run(p.advance(settings.database,include_recent=True))
     assert result['events']==1 and result['processed_originals']==2
-    assert seen==list(p.ROLES)
+    assert seen==list(p.ROLES)+(['event_writer'] if mode=='api' else [])
     with Store(settings.database,read_only=True) as store:
         details=json.loads(store.conn.execute('SELECT details_json FROM pipeline_event_details').fetchone()[0])
         assert 'evidence' not in details and details['curator_image_transcriptions'][0]['sha256']==sha
         if mode=='api':
-            assert len(details['writer']['event_draft'])==1200
-            assert store.conn.execute("SELECT count(*) FROM pipeline_attempts WHERE job_id LIKE '%:event_writer:%'").fetchone()[0]==1
+            assert details['writer']['event_draft']=='We agreed to The book title'
+            assert store.conn.execute("SELECT count(*) FROM pipeline_attempts WHERE job_id LIKE '%:event_writer:%'").fetchone()[0]==2
         assert PNG in store.conn.execute('SELECT metadata_json FROM raw_events WHERE id=1').fetchone()[0]
         refs=[dict(r) for r in store.conn.execute('SELECT * FROM fact_event_sources ORDER BY id')]
         assert [r['message_id'] for r in refs]==['image','reply']
@@ -101,6 +104,9 @@ def test_images_are_frozen_and_transcriptions_cannot_claim_provenance():
     bound=bind_transcriptions(output,images)
     assert bound[0]['source_message_id']==7 and len(bound[0]['sha256'])==64
     assert bound[0]['text']=='Visible original'
+    verify_transcriptions(bound,images)
+    for invalid in ([],bound*2,[{**bound[0],'sha256':'0'*64}],[{**bound[0],'evidence_role':'owned'}]):
+        with pytest.raises(ValueError):verify_transcriptions(invalid,images)
     for entries in ([],output['image_transcriptions']*2,[{**output['image_transcriptions'][0],'source_message_id':99}]):
         with pytest.raises(ValueError):bind_transcriptions({'image_transcriptions':entries},images)
     images[0]['sha256']='0'*64
@@ -163,7 +169,8 @@ def test_writer_bounded_reread_gets_new_context_images_without_owning_them(setti
         if role=='event_writer':
             seen.append('writer')
             assert 99 not in request['event']['source_message_ids']
-            assert request['images'][0]['evidence_role']=='context_only'
+            assert request['images']==[]
+            assert request['curator_image_transcriptions'][0]['evidence_role']=='context_only'
             assert request['curator_image_transcriptions'][0]['text']=='Earlier title'
             with pytest.raises(ValueError):p.validate(request,{'context_request':{'track_id':request['component']['track_ids'][0],'before_message_id':1,'reason':'missing_subject'}})
         return output_for(role,request)
@@ -223,3 +230,74 @@ def test_remote_images_pin_validated_address_and_reject_internal_targets(monkeyp
     monkeypatch.setattr(images.socket,'getaddrinfo',lambda *args:[(2,1,6,'',('127.0.0.1',80))])
     with pytest.raises(ValueError):images.image_bytes('http://example.test/private')
     assert len(connected)==1
+
+
+def test_remote_images_follow_bounded_revalidated_redirects(monkeypatch):
+    from serein.extensions import pipeline_images as images
+    import base64
+    addresses={'short.test':'8.8.8.8','cdn.test':'1.1.1.1'}
+    connected=[];requests=[];responses={
+        ('short.test','/start'): (302,'/next',b''),
+        ('short.test','/next'): (307,'http://cdn.test/book.png',b''),
+        ('cdn.test','/book.png'): (200,None,base64.b64decode(PNG.split(',')[1])),
+    }
+    monkeypatch.setattr(images.socket,'getaddrinfo',lambda host,port:[(2,1,6,'',(addresses[host],port))])
+    monkeypatch.setattr(images.socket,'create_connection',lambda address,**kwargs:connected.append(address))
+    class Reply:
+        def __init__(self,status,location,body):self.status=status;self.location=location;self.body=body
+        def getheader(self,name):return self.location if name.lower()=='location' else None
+        def read(self,size):body,self.body=self.body,b'';return body
+    class Connection:
+        def __init__(self,host,port,**kwargs):self.host=host;self.port=port
+        def request(self,method,path):self.path=path;requests.append((self.host,path))
+        def getresponse(self):return Reply(*responses[(self.host,self.path)])
+        def close(self):pass
+    monkeypatch.setattr(images.http.client,'HTTPConnection',Connection)
+    assert images.image_bytes('http://short.test/start')[1]=='image/png'
+    assert requests==[('short.test','/start'),('short.test','/next'),('cdn.test','/book.png')]
+    assert connected==[('8.8.8.8',80),('8.8.8.8',80),('1.1.1.1',80)]
+
+
+def test_remote_image_redirects_reject_private_targets_and_loops(monkeypatch):
+    from serein.extensions import pipeline_images as images
+    connected=[]
+    def address(host,port):
+        return [(2,1,6,'',(('127.0.0.1' if host=='private.test' else '8.8.8.8'),port))]
+    monkeypatch.setattr(images.socket,'getaddrinfo',address)
+    monkeypatch.setattr(images.socket,'create_connection',lambda target,**kwargs:connected.append(target))
+    class Reply:
+        status=302
+        def __init__(self,location):self.location=location
+        def getheader(self,name):return self.location
+    locations=['http://private.test/image.png','/loop']
+    class Connection:
+        def __init__(self,host,port,**kwargs):self.host=host;self.port=port
+        def request(self,*args):pass
+        def getresponse(self):return Reply(locations.pop(0))
+        def close(self):pass
+    monkeypatch.setattr(images.http.client,'HTTPConnection',Connection)
+    with pytest.raises(ValueError,match='公开图片地址'):
+        images.image_bytes('http://short.test/private')
+    with pytest.raises(ValueError,match='循环'):
+        images.image_bytes('http://short.test/loop')
+    assert connected==[('8.8.8.8',80),('8.8.8.8',80)]
+
+
+def test_remote_image_redirect_limit_is_enforced(monkeypatch):
+    from serein.extensions import pipeline_images as images
+    requests=[]
+    monkeypatch.setattr(images.socket,'getaddrinfo',lambda host,port:[(2,1,6,'',('8.8.8.8',port))])
+    monkeypatch.setattr(images.socket,'create_connection',lambda *args,**kwargs:None)
+    class Reply:
+        status=302
+        def __init__(self,location):self.location=location
+        def getheader(self,name):return self.location
+    class Connection:
+        def __init__(self,host,port,**kwargs):pass
+        def request(self,method,path):requests.append(path)
+        def getresponse(self):return Reply(f'/hop-{len(requests)}')
+        def close(self):pass
+    monkeypatch.setattr(images.http.client,'HTTPConnection',Connection)
+    with pytest.raises(ValueError,match='超过 3 次'):
+        images.image_bytes('http://short.test/start')
+    assert requests==['/start','/hop-1','/hop-2','/hop-3']

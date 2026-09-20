@@ -38,6 +38,15 @@ def test_current_time_defaults_and_timezone_validation(deployment):
     assert client.patch('/v1/settings',json={'clock':{'timezone':'Not/A_Timezone'}}).status_code==422
 
 
+def test_nightly_arc_organization_is_opt_in(deployment):
+    settings, client = deployment
+    assert client.get('/v1/settings').json()['features']['narrative_nightly_organize'] is False
+    saved = client.patch('/v1/settings', json={'features':{'narrative_nightly_organize':True}})
+    assert saved.status_code == 200
+    assert saved.json()['features']['narrative_nightly_organize'] is True
+    assert read_settings(settings.database)['features']['narrative_nightly_organize'] is True
+
+
 def test_passage_settings_are_optional_strict_and_independent(deployment):
     from serein.configured_models import recall_settings
     from serein.deployment import save_settings
@@ -115,6 +124,19 @@ def test_unset_recall_threshold_preserves_toml(deployment):
     assert effective_settings(settings).recall==settings.recall
     client=TestClient(create_app(settings,token='synthetic',live=True),headers={'Authorization':'Bearer synthetic'})
     assert client.get('/v1/settings').json()['recall']['direct_threshold']==.78
+
+
+def test_pipeline_prompt_budget_accepts_large_context_models(deployment):
+    settings,client=deployment
+    saved=client.patch('/v1/settings',json={'pipeline':{'max_prompt_chars':300000,'event_writer_concurrency':2}})
+    assert saved.status_code==200,saved.text
+    assert saved.json()['pipeline']['max_prompt_chars']==300000
+    assert saved.json()['pipeline']['event_writer_concurrency']==2
+    assert read_settings(settings.database)['pipeline']['max_prompt_chars']==300000
+    assert client.patch('/v1/settings',json={'pipeline':{'max_prompt_chars':4000000}}).status_code==200
+    assert client.patch('/v1/settings',json={'pipeline':{'max_prompt_chars':4000001}}).status_code==422
+    for value in (0,9,True,'2'):
+        assert client.patch('/v1/settings',json={'pipeline':{'event_writer_concurrency':value}}).status_code==422
 
 
 def test_recent_original_resume_limit_validation(deployment):
@@ -319,8 +341,9 @@ def test_current_time_only_reaches_chat_context_not_raw_archive(deployment,monke
         json={'messages':[{'role':'user','content':'Clock question on'}],'serein':{'memory':True}})
     assert on.status_code==200
     assert '2026-09-16T06:07:08+09:00 (Asia/Tokyo)' in forwarded[-1]
-    assert forwarded[-1].index('Synthetic recalled memory') < forwarded[-1].index('Serein current date and time')
-    assert forwarded[-1].index('Serein current date and time') < forwarded[-1].index('Current user message:')
+    assert forwarded[-1].index('Synthetic recalled memory') < forwarded[-1].index('Current user message:')
+    assert forwarded[-1].index('Clock question on') < forwarded[-1].index('Serein current date and time')
+    assert forwarded[-1].endswith('</serein_current_time>')
     with Store(settings.database,read_only=True) as store:
         archived='\n'.join(row[0] for row in store.conn.execute('SELECT text FROM raw_events ORDER BY id'))
     assert 'Clock question on' in archived
@@ -500,6 +523,32 @@ def test_native_task_options_and_cache_validation(deployment):
     assert deepseek_anthropic['reasoning']=={'effort':'none'}
     with pytest.raises(ValueError):ModelEntry(**model,prompt_cache='openai')
     with pytest.raises(ValueError):ModelEntry(**model,prompt_cache='anthropic',prompt_cache_retention='24h')
+
+
+def test_deepseek_tool_requests_fill_only_missing_reasoning_content_without_mutating_input():
+    from serein.model_runtime import deepseek_tool_reasoning_compat, request_for
+    model={'model':'deepseek-ai/DeepSeek-V4-Flash','base_url':'https://api.siliconflow.cn/v1','protocol':'openai'}
+    payload={'tools':[{'type':'function','function':{'name':'lookup'}}], 'messages':[
+        {'role':'user','content':'question'},
+        {'role':'assistant','content':'first answer'},
+        {'role':'assistant','content':None,'reasoning_content':None,'tool_calls':[{'id':'a'}]},
+        {'role':'assistant','content':'kept','reasoning_content':'actual reasoning'},
+        {'role':'tool','tool_call_id':'a','content':'result'},
+    ]}
+    patched,count=deepseek_tool_reasoning_compat(model,payload,window_id='operit-window')
+    assert count==2
+    assert [message.get('reasoning_content') for message in patched['messages'] if message.get('role')=='assistant']==[
+        '', '', 'actual reasoning']
+    assert 'reasoning_content' not in payload['messages'][1]
+    assert payload['messages'][2]['reasoning_content'] is None
+    unchanged,count=deepseek_tool_reasoning_compat(
+        {'model':'ordinary','base_url':'https://provider.example/v1','protocol':'openai'},payload)
+    assert unchanged is payload and count==0
+    unchanged,count=deepseek_tool_reasoning_compat(model,{**payload,'tools':[]})
+    assert count==0 and unchanged['messages'] is payload['messages']
+    _,_,forwarded=request_for({**model,'api_key':'synthetic'},payload,window_id='operit-window')
+    assert [message.get('reasoning_content') for message in forwarded['messages'] if message.get('role')=='assistant']==[
+        '', '', 'actual reasoning']
 
 
 @pytest.mark.parametrize('model,expected',[

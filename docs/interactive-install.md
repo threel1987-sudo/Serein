@@ -118,7 +118,7 @@ Docker 两个 Compose 服务为 `gateway`、`memory`；直跑保持相同的服�
 安装脚本依次构建 memory、gateway，降低小内存 VPS 冷安装时的并行资源占用。
 Python 依赖先按 `pyproject.toml` 单独安装，之后才复制并安装 Serein 源码。只修改源码时复用依赖层；首次构建、依赖配置或基础镜像变化、Docker 构建缓存被清理时才重新安装依赖。pip 下载缓存也保留在 BuildKit 中，依赖层需要重建时可以复用已下载的包。
 网关提供需要页面鉴权的前端与代理；
-`/v1/models`、`/v1/chat/completions` 与远程 `/serein/mcp` 共用 Gateway Key，使用 `Authorization: Bearer <Gateway Key>` 鉴权，与页面密码分开。MCP 传输选择 Streamable HTTP，无需额外启动进程。默认连接地址为 `https://你的域名/serein/mcp`；直接访问 IP 时，使用 `http://公网IP:网关端口/serein/mcp`。已有反向代理须把 `/serein/mcp` 和 `/serein/mcp/` 原样转发到同一网关。旧 `/mcp` 和 `/mcp/` 保留兼容，已有客户端无需修改；新旧地址共用同一服务和工具开关。
+`/v1/models`、`/v1/chat/completions` 与远程 `/serein/mcp` 都由 Gateway Key 保护，与页面密码分开。MCP 传输选择 Streamable HTTP，无需额外启动进程。支持 OAuth 的客户端在 `https://你的域名/serein/mcp` 选择 OAuth，随后在 Serein 授权页手动输入 Gateway Key 确认；不支持 OAuth、但可自定义请求头的客户端继续使用 `Authorization: Bearer <Gateway Key>`。OAuth 授权要求 HTTPS 域名（同机 localhost 例外）；公网 IP 的 HTTP 入口只能使用静态 Key。已有反向代理须转发全部路径，不能只放行 `/serein/mcp`，因为 OAuth 还会访问根路径下的 `/.well-known/oauth-*`、`/register`、`/authorize`、`/token`。旧 `/mcp` 和 `/mcp/` 保留兼容。交互菜单配置 HTTPS 时会写入 `SEREIN_PUBLIC_ORIGIN`；手动 Compose/直跑部署也必须把它设为无路径的 HTTPS origin（例如 `https://memory.example.com`）。网关不信任来访请求自行声明的 `X-Forwarded-Proto`。
 
 以网页入口 `https://你的域名` 为例，在客户端填写：
 
@@ -126,9 +126,10 @@ Python 依赖先按 `pyproject.toml` 单独安装，之后才复制并安装 Ser
 | --- | --- | --- |
 | 聊天 API（OpenAI 兼容） | Base URL：`https://你的域名/v1` | API Key 输入框填完整 Gateway Key，不加 `Bearer` 前缀 |
 | 模型列表 / 手动聊天请求 | `GET https://你的域名/v1/models` / `POST https://你的域名/v1/chat/completions` | 请求头 `Authorization: Bearer <Gateway Key>` |
-| MCP（Streamable HTTP） | 服务器 URL：`https://你的域名/serein/mcp` | 请求头名称 `Authorization`，值 `Bearer <Gateway Key>`；若有专门的 Bearer Token 输入框，只填 Key |
+| MCP（Streamable HTTP + OAuth） | 服务器 URL：`https://你的域名/serein/mcp` | 身份验证选 OAuth；授权页输入 Gateway Key 并确认 |
+| MCP（Streamable HTTP + 静态 Key） | 同一服务器 URL | 请求头 `Authorization: Bearer <Gateway Key>`；专门的 Bearer Token 输入框只填 Key |
 
-上表中的 `<Gateway Key>` 要连同尖括号一起替换成实际 Key，`Bearer` 后保留一个空格。直接访问 IP 时，将 `https://你的域名` 替换为实际入口，例如 `http://公网IP:网关端口`。网页登录用安装时设置的用户名和密码；模型厂商的 API Key 填在网页 **设置 → 模型**。这两者都不代替客户端连接 Serein 所需的 Gateway Key。
+上表静态方式中的 `<Gateway Key>` 要连同尖括号一起替换成实际 Key，`Bearer` 后保留一个空格。OAuth 时不要把 Key 写进 URL 或客户端配置，只在域名相同的 Serein 授权页输入。直接访问 IP 时可将地址换成 `http://公网IP:网关端口`，但该方式不能完成 OAuth。网页登录密码和模型厂商 API Key 都不代替 Gateway Key。
 
 升级已有安装后，需要重新部署网关和记忆服务才能使用新 `/serein/mcp` 路由；仅替换管理脚本不会给旧服务增加路由。旧 `/mcp` 地址继续可用。
 
@@ -193,9 +194,11 @@ dynamic、permanent、archive、archived、feel、whisper 目录；不把删除�
 
 清理规则：reflection、affect_anchor 及和弦情绪分节连同其内容删除，其他三级
 标题删除而内容保留。代码块内的 # 不作为分节识别。feel/whisper 转日记。
-网页和一键脚本均可选择“打标时生成召回线索 cues”，默认开启，开启时 cues、主域和实体由同一次打标调用生成；cues 不允许用户和 AI 的名字／别名。
+网页和一键脚本均可选择“打标时生成召回线索 cues”，默认开启，开启时 cues、主域和实体由同一次打标调用生成；cues 不允许用户和 AI 的名字／别名。模型仍返回含这些名字的 cue 时，程序直接丢弃该条并保留其他合格 cues，不为禁名 cue 再次调用模型。
 关闭后只提取主域和实体，不要求或校验模型返回的 cues，也不改写已有 cues。正文与必要的向量准备仍会进行，没有 cues 仍可按正文检索；关闭此项并不免除其他模型费用。
 校验失败后停止自动重试。暂停或失败后可调整 cues 开关并续跑，只影响尚未成功打标的条目，已完成条目不重复调用模型。命令行 options JSON 可设置 `"generate_cues": false`，未填写的旧配置保持开启。
+
+已经迁入当前实例、但因早期版本或中断而缺少 cues 时，可在一键维护菜单选择“旧 Scene 补 cues”。它先预览数量，确认后自动备份，只处理活动的 Ombre 旧导入 Scene；已有 cues、正文和已完成的主域／实体不会覆盖。失败后停止自动重试并保存进度，重跑会继续；空 cues 是有效结果并记为完成。索引同步由写入路径、后台任务和维护脚本负责，不再向聊天模型提供“索引重试”工具。
 每条最多尝试三次，仍失败则保留进度并暂停，错误记录不包含上游原始响应或密钥。
 旧边由程序转换，不调用模型：updates 转 continues 并交换两端；同名且方向明确的现有关系保留。其余不确定项只保留原记录与原因，不生成 related_to（相关）边。旧关联不标成正文证据；已取消、无效端点或不可用的边跳过。支持 state/memory_edges.jsonl 和所选旧库根目录／state 中 SQLite 的 scene_edges、scene_relations、memory_edges 表；扫描预览列出实际读取的文件和数量。
 缺端点、日记端点、归档／不浮现／排除主域不生成新边；无关系是合法结果。

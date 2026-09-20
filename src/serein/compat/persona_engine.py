@@ -135,7 +135,6 @@ class PersonaStateEngine:
             True,
         )
         self.temperature = float(self.persona_cfg.get("temperature", 0.1))
-        self.max_tokens = int(self.persona_cfg.get("max_tokens", 500))
         self.session_mood_half_life_minutes = float(
             self.persona_cfg.get("session_mood_half_life_minutes", 90)
         )
@@ -407,7 +406,6 @@ class PersonaStateEngine:
                 ],
                 **self._completion_options(
                     temperature=0.0,
-                    max_tokens=120,
                     timeout=self.conflict_nudge_timeout_seconds,
                 ),
             )
@@ -1105,8 +1103,7 @@ class PersonaStateEngine:
             FROM persona_events
             WHERE profile_id = ?
             {session_clause}
-            AND (error IS NULL OR error = '')
-            ORDER BY created_at DESC, id DESC
+            ORDER BY id DESC
             LIMIT ?
             """,
             params,
@@ -1465,8 +1462,8 @@ class PersonaStateEngine:
             SELECT id, exchange_hash, event_type, perceived_intent,
                    surface_trigger, inner_thought, residue, created_at
             FROM persona_events
-            WHERE profile_id = ? AND session_id = ? AND (error IS NULL OR error = '')
-            ORDER BY created_at DESC, id DESC
+            WHERE profile_id = ? AND session_id = ? AND error IS NULL
+            ORDER BY id DESC
             LIMIT 1
             """,
             (self.profile_id, session_id),
@@ -1599,12 +1596,10 @@ class PersonaStateEngine:
         self,
         *,
         temperature: float | None = None,
-        max_tokens: int | None = None,
         timeout: float | None = None,
     ) -> dict[str, Any]:
         options: dict[str, Any] = {
             "temperature": self.temperature if temperature is None else temperature,
-            "max_tokens": self.max_tokens if max_tokens is None else max_tokens,
         }
         if timeout is not None:
             options["timeout"] = timeout
