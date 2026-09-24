@@ -39,6 +39,10 @@ def test_three_stage_image_chain_preserves_bytes_transcription_and_raw_sources(s
         assert mode=='api','Agent mode must not call the API'
         with Store(settings.database,read_only=True) as store:
             request=json.loads(store.conn.execute('SELECT request_json FROM pipeline_jobs WHERE output_json IS NULL ORDER BY rowid DESC LIMIT 1').fetchone()[0])
+        if request.get('images'):
+            assert request['images'][0]['url']=='[frozen task image]'
+            from serein.extensions.pipeline_images import hydrate_request_images
+            request=hydrate_request_images(settings.database,request['batch_id'],request)
         if request['role']=='event_curator':assert payload['messages'][1]['content'][1]['image_url']['url']==PNG
         if request['role']=='event_writer':
             assert isinstance(payload['messages'][1]['content'],str) and PNG not in payload['messages'][1]['content']
@@ -75,7 +79,9 @@ def shared_proposals():
     component={'messages':messages,'context_messages':messages,'track_ids':list('abcd'),
                'memberships':units,'context_edges':[{'unit_root_message_id':2,'track_id':'b'},{'unit_root_message_id':4,'track_id':'c'}],
                'base_event_candidates':[{'event_id':'protected','primary_track_id':'a','source_message_ids':[90],'session_ids':[1],'manual':True}]}
-    proposals={'events':[{'action':'extend' if t=='a' else 'create','base_event_ids':['protected'] if t=='a' else [],'primary_track_id':t,'owned_unit_roots':ids} for t,ids in zip('abcd',([1,2],[2,3,4],[4,5],[6,7]))],'skip_unit_roots':[],'defer_unit_roots':[]}
+    proposals={'events':[{'action':'extend' if t=='a' else 'create','base_event_ids':['protected'] if t=='a' else [],'primary_track_id':t,'owned_unit_roots':ids} for t,ids in zip('abcd',([1,2],[2,3,4],[4,5],[6,7]))],'skip_unit_roots':[],'defer_unit_roots':[],
+               'decision_review':{'events':[{'event_index':i,'reason':f'Synthetic Track {i} activity'} for i in range(4)],
+                                  'boundaries':[],'dispositions':[]}}
     return component,proposals
 
 
@@ -116,6 +122,7 @@ def test_images_are_frozen_and_transcriptions_cannot_claim_provenance():
 def test_writer_structure_without_lexical_style_rejection():
     value=output_for('event_writer',{'messages':[{'content':'Synthetic'}]})
     value['event_draft']='我笑称这是一场小小的试验。她说不确定，我说可以再试，她提醒我先记录条件。'
+    value['sentence_evidence'][0]['sentence']=value['event_draft']
     assert 'result_or_unfinished' not in value
     assert latest.validate_event_writer_result(value)==[]
     value['self_review']['result_preserved']=False
@@ -152,10 +159,16 @@ def test_explicit_api_requires_all_models_and_agent_never_calls_api(settings,mon
 
 
 def test_writer_bounded_reread_gets_new_context_images_without_owning_them(settings,monkeypatch):
-    ingest(settings);seen=[]
+    ingest(settings);seen=[];context_ids=[]
     def reread(database,component,query):
+        from serein.compat.raw_archive import raw_archive
+        result=raw_archive(settings).ingest([{
+            'source_event_id':'earlier-image','session_id':'earlier','role':'user','text':'An earlier title',
+            'created_at':'2024-12-31T00:00:00Z',
+            'metadata':{'attachments':[{'kind':'image','url':PNG}]}}],source='synthetic-context')
+        context_id=result['items'][0]['id'];context_ids.append(context_id)
         context=copy.deepcopy(component)
-        context['context_messages'].append({**context['messages'][0],'id':99,'content':'An earlier title',
+        context['context_messages'].append({**context['messages'][0],'id':context_id,'content':'An earlier title',
             'metadata':{'attachments':[{'kind':'image','url':PNG}]}})
         return context
     monkeypatch.setattr(p,'extend_context',reread)
@@ -168,7 +181,7 @@ def test_writer_bounded_reread_gets_new_context_images_without_owning_them(setti
                 'before_message_id':request['component']['messages'][0]['id'],'reason':'missing_subject'}}
         if role=='event_writer':
             seen.append('writer')
-            assert 99 not in request['event']['source_message_ids']
+            assert context_ids[0] not in request['event']['source_message_ids']
             assert request['images']==[]
             assert request['curator_image_transcriptions'][0]['evidence_role']=='context_only'
             assert request['curator_image_transcriptions'][0]['text']=='Earlier title'
@@ -178,7 +191,7 @@ def test_writer_bounded_reread_gets_new_context_images_without_owning_them(setti
     assert seen==['transcribed','writer']
     with Store(settings.database,read_only=True) as store:
         metadata=json.loads(store.conn.execute('SELECT details_json FROM pipeline_event_details').fetchone()[0])
-        assert metadata['curator_image_transcriptions'][0]['source_message_id']==99
+        assert metadata['curator_image_transcriptions'][0]['source_message_id']==context_ids[0]
 
 
 def test_completed_task_media_expires_after_seven_days_but_raw_archive_and_text_remain(settings):

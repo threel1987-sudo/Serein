@@ -25,7 +25,7 @@ Scene、日记和批注工具按自用版的名称、参数和默认值提供。
 | 新建 Scene | `write_scene(content, cues, title='', date='', domain='', evidence_refs=None)`；只必填正文和 cues；可额外传 `favorite` |
 | 修改 Scene | `edit_scene(scene_id, expected_updated_at, title=None, content=None, cues=None)`；先读当前更新时间 |
 | Scene 状态 | `set_scene_status(scene_id, expected_updated_at, status)`；active / archived / deleted，删除为软删除 |
-| 读取日记 | `read_diary(diary_id=None, date='', limit=20)`；按编号、日期读取或列出最近日记 |
+| 读取日记 | `read_diary(diary_id=None, date='', limit=5, query='', offset=0)`；无编号时列目录，支持标题／正文关键词搜索和日期筛选；指定编号才读全文与评论 |
 | 新建日记 | `write_diary(content, date='', title='', author='ai', unlock_at='')`；日期默认当天，未来解锁时间表示暗房日记 |
 | 修订日记 | `revise_diary(diary_id, content, title=None, date=None)`；保留作者及历史 |
 | 日记评论 | `comment_diary(diary_id, content, author='ai')` |
@@ -42,7 +42,7 @@ Scene 和日记的新建调用会独立创建内容；内部随机操作编号�
 
 ## 日记与暗房
 
-日记使用独立存储和工具，不进入普通 Scene／Event 自动召回，也没有收藏状态。网页和 `read_diary` 可以按编号、日期或最近条目读取；`write_diary`、`revise_diary`、`comment_diary`、`delete_diary` 分别新建、修订、评论和软删除。修订保留作者与历史，删除不会改写既有版本。日记可作为叙事卷材料；梦境在最近 48 小时没有新 Event／Scene 时，才回退读取新日记。
+日记使用独立存储和工具，不进入普通 Scene／Event 自动召回，也没有收藏状态。`read_diary()` 默认只列最近 5 篇的编号、日期、标题和最多 150 字符的原文摘要，不带全文和评论。`query` 对标题与正文做字面包含搜索（不是语义搜索，`%`、`_` 不作通配符），标题命中优先，其次按日期和编号倒序；搜索摘要取关键词附近的原文。`date` 按完整日期筛选，可与 `query` 组合。`limit` 为 1–20；有更多结果时返回 `has_more: true` 和 `next_offset`，翻页保持 query/date/limit 不变。只有 `read_diary(diary_id=编号)` 返回完整正文与评论；编号必须为正数，不与 query/offset 混用。封存正文不参与搜索或摘要，删除项不返回。日记结果以普通文字标题开头，不用 `[diary_list]` 外层标签，避免客户端误解析。网页读取接口保持不变。`write_diary`、`revise_diary`、`comment_diary`、`delete_diary` 分别新建、修订、评论和软删除。修订保留作者与历史，删除不会改写既有版本。日记可作为叙事卷材料；梦境在最近 48 小时没有新 Event／Scene 时，才回退读取新日记。
 
 `write_diary` 的 `unlock_at` 填未来时间时创建暗房日记。到期前读取只返回锁定状态，不返回正文；修订、评论和删除同样被拒绝。达到解锁时间后按普通日记读取，原始作者、日期、修订与评论继续保留。锁定由 Serein 的读取与写入接口执行，不改变数据库备份本身的访问权限。
 
@@ -142,13 +142,13 @@ Persona 是只读的状态卡片展示页：当前心情、内心独白/余韵�
 
 本基线按原始消息逐条路由，持久 ownership unit 是单条消息；完整问答 / 主动消息回复包用于判断是否可处理、是否整包 parked，不能与切分器看到的 unit 混为一谈。Curator 按 declared bridge 组成的 Track component 判断经历，必须完整覆盖 stable unit。相关 parked 纠正使前段延后；无关尾巴不拖住已落定经历。
 
-rolling_engineering 只合并仍服务同一建设主线的全部相关 active leaves；不强迫选同 Track 的所有旧 Event，不相关的唯一旧条目也不阻止 create。命中 protected/manual/forked/blocked/scene_ref/narrative_ref 时，host 把拟议替换转成 defer。旧原文与新原文由 host 取 exact union，并继承来源角色；Writer 读取完整前版正文及其 owned 原文，防止逐次合并丢掉早期内容。上下文不会因此获得证据所有权。
+归线 Track 使用可调回看天数（默认三天）：Router 依据已保存归线原话的最近时间读取 Track，不要求 API 上游提供窗口身份。旧 Event 不按年龄退出候选；同一 Track 最多完整读取 8 条 active leaves，第 9 条出现时 host 在读取旧原话、调用 Curator 或 Writer 之前 fail closed，只 defer 该 Track 的稳定原话，其他 Track 继续处理。rolling_engineering 仍合并所有真正服务同一建设主线的相关 active leaves；不相关的唯一旧条目也不阻止 create。命中 protected/manual/forked/blocked/scene_ref/narrative_ref 时，host 把拟议替换转成 defer。旧原文与新原文由 host 取 exact union，并继承来源角色；Writer 读取完整前版正文及其 owned 原文，防止逐次合并丢掉早期内容。上下文不会因此获得证据所有权。
 
 Writer 正文以 1000 字为写作硬上限而非目标，短经历写清即止，不凑字；较长或多次合并的经历优先保留不可替代的原话锚点、关键经过、因果与结果，不逐轮复述。host 以 1500 字作为模型计数误差的容错阈值，超过时进入纠错，程序不截断正文；保留自检与至多两轮结构／证据纠错，不重新切分。Writer 自检和图片转录保存到 pipeline_event_details；原文证据由现有 Event 事务绑定，保留活动叶、指纹、来源集合、引用保护与幂等收据。Scene 仍由聊天里的 agent 主动写，自动 Event 不进入 Bridge 信箱，也不生成 scene_candidate 或创建关系边。
 
 设置 → 功能中的“Event 升为 Scene”（features.event_to_scene）默认关闭。保存后即时启停工具；关闭后拒绝旧客户端继续调用，保留已有 Event 和 Scene。可写实例开启后的 `promote_event_to_scene` 供主窗口在读过 Event 及当前绑定原话后，提交自己编辑的标题和正文。工具核对 Event 当前版本，以新 ID 保存 Scene，沿用 Event 的全部有效原话绑定，并记录来源 Event ID、版本和正文哈希；Event 原件不改写。Scene 覆盖全部原话后，原 Event 停止自动浮现；已有修订箱待处理提示中涉及该 Event 的项撤出，后续扫描也跳过它，Scene 仍按自己的材料资格参与扫描。重复操作 ID 返回原回执；另一操作再次转换同一 Event 会报冲突，后续修改应编辑已生成的 Scene。
 
-宿主改为公开版数据库和模型 API：只处理显式导入或归档的原话。Track 卡不设时间 TTL；归线默认读取同一 source、同一 runtime／workspace 边界下当前及前一个可见会话的 Track。再次使用的卡随当前窗口前移；未使用的卡留在最后实际出现的窗口，超出两窗口可见范围后不再参与 Router，但仍保存在库中。额外原文请求限定 declared Track / 可见会话 / 六个历史 unit，且仅一次。图片通过已归档的 URL / data URI 交给图片转录模型或 Curator；Writer 初写及修复只读已绑定的转录，不附原图。不读取私有聊天宿主的图片目录。各角色模型留空时，在设置页打开 Agent 配置弹窗，按说明接入后领取与提交任务；叙事卷 Writer 有独立 runner 引导。原先短版任务协议中尚未完成的任务保留为旧记录，新协议重新从未处理原话开始，已结算正文不重写。
+宿主改为公开版数据库和模型 API：只处理显式导入或归档的原话。Track 卡不设删除 TTL；归线默认读取同一 source、同一 runtime／workspace 边界下，在配置回看天数内实际归入过原话的 Track。再次使用会刷新最近归线锚点；超期卡不再参与 Router，但仍保存在库中。额外原文请求限定 declared Track / 可见会话 / 六个历史 unit，且仅一次。图片通过已归档的 URL / data URI 交给图片转录模型或 Curator；Writer 初写及修复只读已绑定的转录，不附原图。不读取私有聊天宿主的图片目录。各角色模型留空时，在设置页打开 Agent 配置弹窗，按说明接入后领取与提交任务；叙事卷 Writer 有独立 runner 引导。原先短版任务协议中尚未完成的任务保留为旧记录，新协议重新从未处理原话开始，已结算正文不重写。
 
 执行方式与配置见 [自动摘要](automatic-events.md)、[扩展接口](extensions.md)。
 

@@ -32,7 +32,10 @@ def test_parked_correction_is_readable_but_not_owned(settings):
     assert 'cannot make' in rendered['units'][-1]['messages'][0]['text']
     output=output_for('event_curator',task['request']);output['events'][0]['owned_unit_roots'].append(component['parked_context_source_ids'][0])
     with pytest.raises(ValueError):p.validate(task['request'],output)
-    deferred={'events':[],'skip_unit_roots':[],'defer_unit_roots':[m['id'] for m in component['messages']]}
+    deferred={'events':[],'skip_unit_roots':[],'defer_unit_roots':[m['id'] for m in component['messages']],
+              'decision_review':{'events':[],'boundaries':[],
+                  'dispositions':[{'disposition':'defer','unit_roots':[m['id'] for m in component['messages']],
+                                   'reason':'parked 原文撤回了约定时间','parked_source_message_ids':component['parked_context_source_ids']}]}}
     assert len(latest.normalize_event_curator_output(deferred,component)['defer_source_message_ids'])==2
 
 
@@ -85,13 +88,62 @@ def test_writer_body_uses_1000_guidance_with_1500_tolerance():
     request={'messages':[{'id':1,'content':'A book was returned'}]}
     output=output_for('event_writer',request)
     output['event_draft']='书还了。'
+    output['sentence_evidence'][0]['sentence']=output['event_draft']
     assert latest.validate_event_writer_result(output)==[]
     output['event_draft']='书'*1500
+    output['sentence_evidence'][0]['sentence']=output['event_draft']
     assert latest.validate_event_writer_result(output)==[]
     output['event_draft']='书'*1501
     assert '正文超过容错上限 1500 字：1501 字' in ' '.join(latest.validate_event_writer_result(output))
     output['title']=''
     assert '标题为空' in latest.validate_event_writer_result(output)
+
+
+def test_public_writer_materializes_source_grounded_rules_with_configured_names():
+    with latest.identity_scope({'ai_name': 'Atlas', 'user_name': 'Lin'}):
+        rules = latest.materialize_agent_rules('event_writer')
+    assert 'Atlas 在回复中对Lin的话作出的展开' in rules
+    assert '最小完整语义单位' in rules and '局部回应不能改变前句' in rules
+    assert '不额外补出理解、判断、解释等动作' in rules
+    assert '不把某一种归属句式当成模板' in rules
+    assert '原文停留在“想、打算、建议' in rules
+    assert '反例三' in rules and '台灯' in rules
+    assert '我把这句话理解成' not in rules
+    assert 'Haven' not in rules and '小雨' not in rules
+
+
+def test_writer_source_timestamps_are_explicit_shanghai_time():
+    rows = latest.writer_transcript_payload([
+        {'id': 1, 'role': 'user', 'content': 'late note', 'created_at': '2025-01-01T17:30:00Z'},
+        {'id': 2, 'role': 'assistant', 'content': 'legacy', 'created_at': '2025-01-01T18:00:00'}])
+    assert rows[0]['created_at'] == '2025-01-02T01:30:00+08:00'
+    assert rows[1]['created_at'] == '2025-01-02T02:00:00+08:00'
+    assert latest.writer_source_time('not-a-time') == 'not-a-time'
+
+
+def test_router_and_curator_keep_developing_activity_over_keyword_or_tone():
+    router = latest.materialize_agent_rules('track_router')
+    curator = latest.materialize_agent_rules('event_curator')
+    assert '不是作品、项目、关系或生活领域的长期 Arc' in router
+    assert '只共享人物、关系、作品、产品、项目或技术栈，不构成续接' in router
+    assert '用一句短语标识这一次具体对象或事项' in router
+    assert '只可纠正对象、去掉阶段性措辞或收窄' in router
+    assert '不得为了容纳另一项活动而扩大' in router
+    assert '《作品》更新第 N 话' in router
+    assert '下一批判断直接续接的最小线索' in router
+    assert '另一话更新而开启一次新的完整观看' in router
+    assert '不按醒目的称呼、作品名或重复关键词投票归线' in router
+    assert '从事实转成玩笑或幻想' in router
+    assert '正常使用，不自动续接它的安装、调试 Track' in router
+    assert '不因语气变化或转为调笑就拆分' in curator
+    assert '不能只贴“技术／情感”等不同类别标签' in curator
+
+
+def test_router_prompt_requests_concrete_track_scope():
+    prompt = latest.build_event_track_message_prompt('2026-09-23', [], [])
+    assert '"subject":"具体对象或事项"' in prompt
+    assert '"throughline":"这段经历的最小续接线索"' in prompt
+    assert '仅仅属于同一产品或系统不够' in prompt
 
 
 def test_model_counting_tolerance_settles_without_truncation(settings):
@@ -101,6 +153,7 @@ def test_model_counting_tolerance_settles_without_truncation(settings):
     task=asyncio.run(p.advance(settings.database,include_recent=True))
     output=output_for('event_writer',task['request'])
     output['event_draft']='书'*1500
+    output['sentence_evidence'][0]['sentence']=output['event_draft']
     p.submit(settings.database,task['job_id'],output)
     assert asyncio.run(p.advance(settings.database,include_recent=True))['events']==1
     with Store(settings.database,read_only=True) as store:

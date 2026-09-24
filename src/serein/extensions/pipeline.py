@@ -10,12 +10,16 @@ from ..compat.events import Events, reference_blockers
 from .pipeline_rules import dialogue_units, dialogue_unit_is_complete, normalize_event_track_message_output, flushable_dialogue_units
 from . import pipeline_latest as latest
 from .pipeline_config import snapshot, execution
-from .pipeline_images import freeze_images, verify_images, bind_transcriptions, verify_transcriptions, decision, expire_completed_media
+from .pipeline_images import (freeze_task_images, persistable_request, hydrate_request_images,
+    verify_images, bind_transcriptions,
+    verify_transcriptions, decision, expire_completed_media,
+    compact_completed_snapshots, compact_batch_snapshot, compact_job_request)
 from . import pipeline_tracks as track_state
 
 ROLES=('track_router','event_curator','event_writer')
 TZ=timezone(timedelta(hours=8))
-CONTRACT='public-event-message-tracks-v5'
+CONTRACT='public-event-message-tracks-v7'
+EVENT_CURATOR_MAX_ACTIVE_LEAVES_PER_TRACK=8
 
 
 class RoutingRecoveryError(ValueError):
@@ -35,6 +39,9 @@ def initialize(database):
             CREATE TABLE IF NOT EXISTS pipeline_schedule(day TEXT PRIMARY KEY,completed INTEGER NOT NULL DEFAULT 0);
             CREATE TABLE IF NOT EXISTS pipeline_attempts(id INTEGER PRIMARY KEY,job_id TEXT NOT NULL,attempt INTEGER NOT NULL,
                 created_at TEXT NOT NULL,output_text TEXT NOT NULL,error TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS pipeline_media(batch_id TEXT NOT NULL,source_message_id INTEGER NOT NULL,
+                position INTEGER NOT NULL,sha256 TEXT NOT NULL,mime_type TEXT NOT NULL,body BLOB NOT NULL,
+                PRIMARY KEY(batch_id,source_message_id,position));
         ''')
         from .pipeline_recovery import initialize as initialize_recovery
         initialize_recovery(store.conn)
@@ -51,21 +58,53 @@ def initialize(database):
         # restart only unfinished batches; already settled originals stay settled.
         store.conn.execute("UPDATE pipeline_batches SET status='superseded_protocol' WHERE status='pending' AND json_extract(input_json,'$.contract') IS NULL")
         store.conn.execute("UPDATE pipeline_batches SET status='superseded_protocol' WHERE status='pending' AND json_extract(input_json,'$.contract')<>?",(CONTRACT,))
+        compact_completed_snapshots(store)
         expire_completed_media(store)
 
 
 def message(row):
     row=dict(row);session=str(row.get('session_id') or '')
-    row['metadata']=row.get('metadata') or json.loads(row.get('metadata_json') or '{}')
-    try:row['image_transcription']=json.loads(row.get('image_transcription_json') or 'null')
+    metadata_json=row.pop('metadata_json',None)
+    transcription_json=row.pop('image_transcription_json',None)
+    row['metadata']=row.get('metadata') or json.loads(metadata_json or '{}')
+    try:row['image_transcription']=json.loads(transcription_json or 'null')
     except (TypeError,ValueError):row['image_transcription']=None
     original=row['metadata'].get('original_message') or {}
     if original.get('attachments') and not row['metadata'].get('attachments'):
         row['metadata']={**row['metadata'],'attachments':original['attachments']}
-    row['content']=row.get('text',row.get('content',''))
+    row['content']=row.pop('text',row.get('content',''))
+    for key in ('event_hash','ingested_at','conversation_id','client','image_transcription_status','image_transcription_updated_at'):
+        row.pop(key,None)
     row['original_session_id']=row.get('original_session_id',session)
     row['session_id']=int(digest(encode([row.get('source'),session]))[:12],16)
     return row
+
+
+def task_message(row):
+    """Project a canonical raw row without copying inline image bytes into task JSON."""
+    def strip(value,key=''):
+        if isinstance(value,dict):return {name:strip(item,name) for name,item in value.items()}
+        if isinstance(value,list):return [strip(item,key) for item in value]
+        if isinstance(value,str) and (key=='content_base64' or value.startswith('data:image/')):
+            return '[task image source]'
+        return value
+    projected=message(row)
+    projected['metadata']=strip(projected.get('metadata') or {})
+    return projected
+
+
+def image_source_messages(database,messages):
+    """Hydrate attachment bytes only for the immediate image-model request."""
+    wanted={int(item['id']):item for item in messages}
+    hydrated=dict(wanted)
+    raw_ids=[key for key in wanted if key>0]
+    if raw_ids:
+        with Store(database,read_only=True) as store:
+            for offset in range(0,len(raw_ids),400):
+                chunk=raw_ids[offset:offset+400];marks=','.join('?' for _ in chunk)
+                for row in store.conn.execute('SELECT * FROM raw_events WHERE id IN ('+marks+')',chunk):
+                    hydrated[row['id']]=message(row)
+    return [hydrated[int(item['id'])] for item in messages]
 
 
 def rules(role,database):
@@ -98,20 +137,41 @@ def new_batch(database,include_recent,clock=None):
             if not ((current_limit<frozen_limit and len(rechunked)>1) or
                     (current_limit>=frozen_limit and stable_chunks>1)):
                 return dict(old)
-            # Keep accepted Router output before retiring an oversized unfinished batch.
+            # Preserve accepted Router jobs, but publish route cache only when a
+            # frozen Router frame still matches one complete chunk under the new
+            # transport budget. A frame spanning multiple replacement chunks
+            # cannot safely supply a prefix Track card because its prose may
+            # include future material. Clear that stale cache and let the fresh
+            # batch reroute instead.
+            reusable_frames={tuple(m['id'] for m in block) for block in rechunked}
+            from .pipeline_recovery import record_routes
             for row in store.conn.execute("SELECT request_json,output_json FROM pipeline_jobs WHERE batch_id=? AND role LIKE 'track_router%' AND output_json IS NOT NULL ORDER BY rowid",(old['id'],)):
                 request=json.loads(row['request_json'])
                 assignments,cards,_=normalize_event_track_message_output(json.loads(row['output_json']),request['messages'],request['active_tracks'],
                     session_id=old_data['scope'],next_track_ordinal=request.get('next_track_ordinal',track_state.next_ordinal(old_data['scope'],request['active_tracks'])))
+                frame_ids=tuple(m['id'] for m in request['messages'])
+                route_ids=[a['source_message_id'] for a in assignments]
+                if frame_ids not in reusable_frames:
+                    for raw_id in route_ids:
+                        producer=store.conn.execute(
+                            'SELECT batch_id FROM pipeline_route_provenance WHERE raw_id=?',(raw_id,)
+                        ).fetchone()
+                        # Do not erase a newer/different explicit producer merely
+                        # because this older pending frame is being retired.
+                        if producer is not None and producer['batch_id']!=old['id']:
+                            continue
+                        store.conn.execute('DELETE FROM pipeline_routes WHERE raw_id=?',(raw_id,))
+                        store.conn.execute('DELETE FROM pipeline_route_provenance WHERE raw_id=?',(raw_id,))
+                    continue
                 for card in cards:store.conn.execute('INSERT OR IGNORE INTO pipeline_tracks VALUES (?,?,?)',(card['track_id'],old_data['scope'],encode(card)))
-                for a in assignments:store.conn.execute('INSERT OR IGNORE INTO pipeline_routes VALUES (?,?)',(a['source_message_id'],encode(a)))
+                record_routes(store.conn,old['id'],assignments)
             store.conn.execute("UPDATE pipeline_batches SET status='superseded_input_budget' WHERE id=?",(old['id'],))
         complete_upload=''
         if store.conn.execute("SELECT 1 FROM sqlite_master WHERE name='file_imports'").fetchone():
             complete_upload=" AND (json_extract(r.metadata_json,'$.import_upload_id') IS NULL OR json_extract(r.metadata_json,'$.import_upload_id') IN (SELECT id FROM file_imports WHERE cursor=json_array_length(payload_json,'$.entries')))"
         scopes=store.conn.execute('SELECT DISTINCT r.source,r.session_id FROM raw_events r WHERE NOT EXISTS (SELECT 1 FROM raw_processing p WHERE p.raw_id=r.id)'+complete_upload+' ORDER BY r.id').fetchall()
         for source,session in scopes:
-            rows=[message(row) for row in store.conn.execute('SELECT r.* FROM raw_events r WHERE source=? AND session_id=? AND NOT EXISTS (SELECT 1 FROM raw_processing p WHERE p.raw_id=r.id)'+complete_upload+' ORDER BY r.id',(source,session))]
+            rows=[task_message(row) for row in store.conn.execute('SELECT r.* FROM raw_events r WHERE source=? AND session_id=? AND NOT EXISTS (SELECT 1 FROM raw_processing p WHERE p.raw_id=r.id)'+complete_upload+' ORDER BY r.id',(source,session))]
             eligible=[r for r in rows if datetime.fromisoformat(r['created_at'].replace('Z','+00:00'))<=watermark]
             chunks=blocks(eligible,policy['max_input_chars'])
             for chunk_index,eligible in enumerate(chunks):
@@ -128,8 +188,9 @@ def new_batch(database,include_recent,clock=None):
                 if not stable:continue
                 scope=digest(encode([source,session]))[:20]
                 with latest.identity_scope(identity(database)):
-                    tracks,ordinal=track_state.load_tracks(store,source,session,eligible[0]['id'],message)
-                recent=[message(row) for row in store.conn.execute('SELECT * FROM raw_events WHERE source=? AND session_id=? AND id<? ORDER BY id DESC LIMIT 6',(source,session,eligible[0]['id']))][::-1]
+                    tracks,ordinal=track_state.load_tracks(store,source,session,eligible[0]['id'],task_message,
+                                                           lookback_days=policy.get('track_lookback_days',3))
+                recent=[task_message(row) for row in store.conn.execute('SELECT * FROM raw_events WHERE source=? AND session_id=? AND id<? ORDER BY id DESC LIMIT 6',(source,session,eligible[0]['id']))][::-1]
                 data={'contract':CONTRACT,'input_policy':policy,'messages':stable,'parked':parked,'routing_messages':eligible,'tracks':tracks,'next_track_ordinal':ordinal,'scope':scope,'source':source,'recent':recent,'day':watermark.date().isoformat()}
                 key='pipeline:'+digest(encode(data))
                 existing=store.conn.execute('SELECT status FROM pipeline_batches WHERE id=?',(key,)).fetchone()
@@ -265,6 +326,9 @@ def save_routing_snapshot(database,batch,data,routed):
         raise RoutingRecoveryError('frozen components disagree with recovered routing result')
     data['routing_result']=routed
     data.setdefault('components',fresh)
+    if batch['status']=='needs_repair':
+        data['last_routing_repair']={'checked_at':now(),'previous_result':json.loads(batch['result_json'])}
+    encoded_data=encode(data)
     with Store(database) as store,store.transaction(immediate=True):
         if routed.get('recovered_route_sources'):
             # Historical recovery must never rewind a Track card that has moved
@@ -277,10 +341,9 @@ def save_routing_snapshot(database,batch,data,routed):
         else:
             track_state.persist(store.conn,routed['track_state_updates'],data['scope'],preserve_newer=True)
         if batch['status']=='needs_repair':
-            data['last_routing_repair']={'checked_at':now(),'previous_result':json.loads(batch['result_json'])}
             store.conn.execute("UPDATE pipeline_batches SET status='pending',result_json=NULL WHERE id=?",(batch['id'],))
-        store.conn.execute('UPDATE pipeline_batches SET input_json=? WHERE id=?',(encode(data),batch['id']))
-    batch['input_json']=encode(data)
+        store.conn.execute('UPDATE pipeline_batches SET input_json=? WHERE id=?',(encoded_data,batch['id']))
+    batch['input_json']=encoded_data
     return data
 
 
@@ -366,16 +429,27 @@ async def route_batch(database,batch,data,runner):
 def source_key(ref):return (ref['source_system'],ref['session_id'],ref['message_id'])
 
 
-def candidates(database,track_ids):
+def candidates(database,track_ids,*,overflow_out=None):
+    """Load every active leaf for a Track, or fail closed before reading sources."""
     result=[]
     with Store(database,read_only=True) as store:
         for track in track_ids:
-            for row in store.conn.execute("SELECT e.* FROM pipeline_track_events p JOIN fact_events e ON e.item_id=p.event_id WHERE p.track_id=? AND e.status='active'",(track,)):
+            rows=store.conn.execute("SELECT e.* FROM pipeline_track_events p JOIN fact_events e ON e.item_id=p.event_id "
+                "WHERE p.track_id=? AND e.status='active' ORDER BY julianday(e.created_at),e.item_id",(track,)).fetchall()
+            if len(rows)>EVENT_CURATOR_MAX_ACTIVE_LEAVES_PER_TRACK:
+                overflow={'track_id':track,'eligible_active_leaf_count':len(rows),
+                          'limit':EVENT_CURATOR_MAX_ACTIVE_LEAVES_PER_TRACK,
+                          'event_ids':[row['item_id'] for row in rows]}
+                if overflow_out is None:
+                    raise ValueError('Track component exceeds the bounded active Event leaf limit')
+                overflow_out.append(overflow)
+                continue
+            for row in rows:
                 refs=[dict(ref) for ref in store.conn.execute('SELECT * FROM fact_event_sources WHERE item_id=? ORDER BY id',(row['item_id'],))]
                 originals=[]
                 for ref in refs:
                     raw=store.conn.execute('SELECT * FROM raw_events WHERE source=? AND session_id=? AND source_event_id=?',source_key(ref)).fetchone()
-                    originals.append(message(raw) if raw else message({'id':-int(digest(encode(source_key(ref)))[:12],16),'source':ref['source_system'],'source_event_id':ref['message_id'],'session_id':ref['session_id'],'role':ref['role'],'text':ref['content'],'created_at':ref['created_at']}))
+                    originals.append(task_message(raw) if raw else task_message({'id':-int(digest(encode(source_key(ref)))[:12],16),'source':ref['source_system'],'source_event_id':ref['message_id'],'session_id':ref['session_id'],'role':ref['role'],'text':ref['content'],'created_at':ref['created_at']}))
                 detail=store.conn.execute('SELECT details_json FROM pipeline_event_details WHERE event_id=?',(row['item_id'],)).fetchone()
                 details=json.loads(detail[0]) if detail else {}
                 blockers=reference_blockers(store.conn,row['item_id'])
@@ -416,10 +490,14 @@ def components(database,data,routed,*,include_materials=True):
         }
         component_memberships=[unit for unit in memberships if int(unit['unit_root_message_id']) in roots]
         component_edges=[edge for edge in edges if int(edge['unit_root_message_id']) in roots]
-        bases=candidates(database,[track_id]) if include_materials else []
+        overflow=[]
+        bases=candidates(database,[track_id],overflow_out=overflow) if include_materials else []
         context={a['source_message_id']:by_id[a['source_message_id']] for a in direct}
         for base in bases:
             context.update({m['id']:m for m in base['originals']})
+        # Bound originals live once in context_messages. Candidates retain only
+        # their canonical refs/IDs and Event fields needed by Curator/settlement.
+        bases=[{key:value for key,value in base.items() if key!='originals'} for base in bases]
         result.append({
             'component_id':track_id,
             'track_ids':[track_id],
@@ -430,9 +508,18 @@ def components(database,data,routed,*,include_materials=True):
             'memberships':component_memberships,
             'context_edges':component_edges,
             'base_event_candidates':bases,
+            'base_event_candidate_overflow':overflow,
             'context_session_ids':list({m['session_id'] for m in context.values()}),
         })
     return result
+
+
+def overflow_plan(component):
+    """Defer an overflowing Track without invoking Curator or Writer."""
+    stable_ids=sorted({int(item['id']) for item in component.get('messages') or []})
+    if not stable_ids:raise ValueError('Overflowing Track component has no stable sources to defer')
+    return {'events':[],'skip_source_message_ids':[],'defer_source_message_ids':stable_ids,
+            'hard_skips':[],'host_deferrals':list(component.get('base_event_candidate_overflow') or [])}
 
 
 def routing_units(messages,assignments):
@@ -484,10 +571,13 @@ def request_for(database,batch,role,**fields):
             prompt=latest.build_event_track_message_prompt(data['day'],request['messages'],request['active_tracks'],recent_context_messages=data['recent'])
         elif role=='event_curator':
             component=fields['component']
-            images,missing=writer_images(component['context_messages'],{m['id'] for m in component['messages']})
+            image_messages=image_source_messages(database,component['context_messages'])
+            images,missing=writer_images(image_messages,{m['id'] for m in component['messages']})
             if missing:raise ValueError('绑定图片缺少原图，请补齐附件；原话仍保留')
-            component['images']=freeze_images(images,component.get('images',[]))
-            request['images']=[{**item,'evidence_role':'stable' if item['source_message_id'] in {m['id'] for m in component['messages']} else 'context_only'} for item in component['images']]
+            frozen_images=freeze_task_images(database,batch['id'],images,component.get('images',[]))
+            component['images']=[{key:value for key,value in item.items() if key not in ('url','original_url')}
+                                 for item in frozen_images]
+            request['images']=[{**item,'evidence_role':'stable' if item['source_message_id'] in {m['id'] for m in component['messages']} else 'context_only'} for item in frozen_images]
             prompt=latest.build_event_track_curator_prompt(data['day'],component)
             if fields.get('pretranscribed'):
                 request['curator_image_transcriptions']=list(component.get('curator_image_transcriptions',[]))
@@ -541,10 +631,19 @@ def validate(request,output):
                 if request.get('context_read') or set(output)!={'context_request'} or not isinstance(c,dict) or c.get('track_id') not in component['track_ids'] or c.get('before_message_id')!=min(m['id'] for m in component['messages']) or c.get('reason') not in ('missing_subject','missing_origin','missing_prior_claim'):
                     raise ValueError('Only one bounded component context request is allowed')
             else:
-                bind_transcriptions(output,request.get('images',[]))
-                latest.normalize_event_curator_output(decision(output),request['component'])
+                bound=bind_transcriptions(output,request.get('images',[]))
+                component={**request['component']}
+                if bound:
+                    component['curator_image_transcriptions']=bound
+                latest.normalize_event_curator_output(decision(output),component)
         else:
-            errors=latest.validate_event_writer_result(output)
+            transcriptions:dict[int,list[str]]={}
+            for item in request.get('curator_image_transcriptions') or []:
+                if item.get('evidence_role')=='owned' and type(item.get('source_message_id')) is int:
+                    transcriptions.setdefault(item['source_message_id'],[]).append(str(item.get('text') or ''))
+            owned=[{**item,'evidence_texts':transcriptions.get(item.get('id'),[])}
+                   for item in request.get('messages') or []]
+            errors=latest.validate_event_writer_result(output,owned)
             if errors:raise ValueError('; '.join(errors))
 
 
@@ -565,17 +664,28 @@ def submit(database,job_id,output):
 
 def _submit(database,job_id,output):
     initialize(database)
-    with Store(database) as store,store.transaction(immediate=True):
+    encoded_output=encode(output)
+    with Store(database,read_only=True) as store:
         row=store.conn.execute('SELECT j.*,b.status FROM pipeline_jobs j JOIN pipeline_batches b ON b.id=j.batch_id WHERE j.id=?',(job_id,)).fetchone()
         if row is None:raise ValueError('Unknown pipeline job')
-        if json.loads(row['request_json'])['role'] not in ROLES:
-            raise ValueError('This pipeline stage is retired; request the next task')
+        frozen_request=row['request_json'];existing_output=row['output_json'];status=row['status']
+    request=hydrate_request_images(database,row['batch_id'],json.loads(frozen_request))
+    if request['role'] not in ROLES:
+        raise ValueError('This pipeline stage is retired; request the next task')
+    if status.startswith('superseded_'):raise ValueError('任务输入已更新，请重新领取任务；原话和已完成的归线仍保留')
+    if existing_output:
+        if existing_output!=encoded_output:raise Conflict('This job already has a different result')
+        return {'status':'unchanged','job_id':job_id}
+    validate(request,output)
+    with Store(database) as store,store.transaction(immediate=True):
+        row=store.conn.execute('SELECT j.*,b.status FROM pipeline_jobs j JOIN pipeline_batches b ON b.id=j.batch_id WHERE j.id=?',(job_id,)).fetchone()
+        if row is None or row['request_json']!=frozen_request:
+            raise Conflict('Pipeline job changed while its result was being validated')
         if row['status'].startswith('superseded_'):raise ValueError('任务输入已更新，请重新领取任务；原话和已完成的归线仍保留')
         if row['output_json']:
-            if row['output_json']!=encode(output):raise Conflict('This job already has a different result')
+            if row['output_json']!=encoded_output:raise Conflict('This job already has a different result')
             return {'status':'unchanged','job_id':job_id}
-        validate(json.loads(row['request_json']),output)
-        store.conn.execute('UPDATE pipeline_jobs SET output_json=? WHERE id=?',(encode(output),job_id))
+        store.conn.execute('UPDATE pipeline_jobs SET output_json=? WHERE id=?',(encoded_output,job_id))
     return {'status':'accepted','job_id':job_id}
 
 
@@ -586,16 +696,18 @@ class AwaitAgent(Exception):
 async def job(database,batch,request,key,runner):
     from ..work_tasks import progress
     identifier=batch['id']+':'+key
+    encoded_request=encode(persistable_request(request))
     with Store(database) as store,store.transaction(immediate=True):
-        store.conn.execute('INSERT OR IGNORE INTO pipeline_jobs(id,batch_id,role,request_json) VALUES (?,?,?,?)',(identifier,batch['id'],key,encode(request)))
+        store.conn.execute('INSERT OR IGNORE INTO pipeline_jobs(id,batch_id,role,request_json) VALUES (?,?,?,?)',(identifier,batch['id'],key,encoded_request))
         row=store.conn.execute('SELECT * FROM pipeline_jobs WHERE id=?',(identifier,)).fetchone()
     incoming=request
     current_execution=request['execution']
-    request=json.loads(row['request_json'])
+    request=hydrate_request_images(database,batch['id'],json.loads(row['request_json']))
     request['execution']=current_execution
     incoming.clear();incoming.update(request)
     if not row['output_json']:
-        with Store(database) as store:store.conn.execute('UPDATE pipeline_jobs SET request_json=? WHERE id=?',(encode(request),identifier))
+        encoded_request=encode(persistable_request(request))
+        with Store(database) as store:store.conn.execute('UPDATE pipeline_jobs SET request_json=? WHERE id=?',(encoded_request,identifier))
     with Store(database,read_only=True) as store:
         completed=store.conn.execute("SELECT count(*) FROM pipeline_jobs WHERE batch_id=? AND output_json IS NOT NULL AND json_extract(request_json,'$.role')!='event_evidence'",(batch['id'],)).fetchone()[0]
         total=store.conn.execute("SELECT count(*) FROM pipeline_jobs WHERE batch_id=? AND json_extract(request_json,'$.role')!='event_evidence'",(batch['id'],)).fetchone()[0]
@@ -671,7 +783,8 @@ def extend_context(database,component,context_request):
         rows=store.conn.execute('SELECT r.* FROM pipeline_routes p JOIN raw_events r ON r.id=p.raw_id WHERE r.id<? AND (json_extract(p.route_json,\'$.primary_track_id\')=? OR EXISTS (SELECT 1 FROM json_each(p.route_json,\'$.context_track_ids\') WHERE value=?)) ORDER BY r.id DESC',
             (context_request['before_message_id'],context_request['track_id'],context_request['track_id'])).fetchall()
     existing={m['id']:m for m in component['context_messages']}
-    prior=[message(r) for r in reversed(rows) if message(r)['session_id'] in component['context_session_ids']]
+    projected=[task_message(r) for r in reversed(rows)]
+    prior=[item for item in projected if item['session_id'] in component['context_session_ids']]
     units=[[item] for item in sorted(prior,key=lambda item:item['id'])[-6:]]
     selected=[m for unit in units for m in unit]
     existing.update({m['id']:m for m in selected})
@@ -704,7 +817,10 @@ def settle(database,batch,data,routed,plans):
             if bases:
                 item.update(supersedes_item_ids=[b['event_id'] for b in bases],expected_predecessors=[{'item_id':b['event_id'],'fingerprint':b['fingerprint'],
                     'source_keys':[dict(zip(('source_system','session_id','message_id'),source_key(ref))) for ref in b['source_refs']]} for b in bases])
-            items.append(item);details.append({'track_id':event['primary_track_id'],'writer':written,'curator_image_transcriptions':written.get('curator_image_transcriptions',[]),'source_activity_roles':{str(b['source_message_id']):b['activity_role'] for b in event['source_bindings']}})
+            items.append(item);details.append({'track_id':event['primary_track_id'],'writer':written,
+                'curator_decision_review':plan.get('decision_review'),
+                'curator_image_transcriptions':written.get('curator_image_transcriptions',[]),
+                'source_activity_roles':{str(b['source_message_id']):b['activity_role'] for b in event['source_bindings']}})
             settled.update(key for key in event['source_message_ids'] if key in all_new)
     # A shared bridge unit may be visible in two bounded Track corridors. Host
     # settlement is global per raw source, so corridor outcomes need a stable
@@ -718,7 +834,14 @@ def settle(database,batch,data,routed,plans):
             'pending':len(data['messages'])+len(data['parked'])-len(processed),
             'skipped':sum(value=='skipped' for value in processed.values()),
             'deferred':len(deferred),
-            'protected_deferrals':[entry for _,plan,_ in plans for entry in plan['hard_skips']]}
+            'protected_deferrals':[entry for _,plan,_ in plans for entry in plan['hard_skips']],
+            'candidate_overflow_deferrals':[entry for _,plan,_ in plans for entry in plan.get('host_deferrals',[])],
+            'task_snapshot_compacted':True}
+    compacted_input=encode(compact_batch_snapshot(data))
+    with Store(database,read_only=True) as store:
+        compacted_jobs=[(encode(compact_job_request(row['request_json'])),row['id']) for row in
+                        store.conn.execute('SELECT id,request_json FROM pipeline_jobs WHERE batch_id=?',(batch['id'],))]
+    encoded_result=encode(result)
     def finish(conn):
         from .pipeline_recovery import record_routes
         record_routes(conn,batch['id'],assignments)
@@ -731,7 +854,11 @@ def settle(database,batch,data,routed,plans):
                 fingerprint=conn.execute('SELECT fingerprint FROM fact_events WHERE item_id=?',(key,)).fetchone()[0]
                 enqueue(conn,key,fingerprint)
         for key,outcome in processed.items():conn.execute('INSERT OR IGNORE INTO raw_processing VALUES (?,?,?)',(key,batch['id'],outcome))
-        conn.execute("UPDATE pipeline_batches SET status='done',result_json=? WHERE id=?",(encode(result),batch['id']))
+        for request_json,job_id in compacted_jobs:
+            conn.execute('UPDATE pipeline_jobs SET request_json=? WHERE id=?',(request_json,job_id))
+        conn.execute('DELETE FROM pipeline_media WHERE batch_id=?',(batch['id'],))
+        conn.execute("UPDATE pipeline_batches SET status='done',input_json=?,result_json=? WHERE id=?",
+                     (compacted_input,encoded_result,batch['id']))
     if items:
         Events(database).settle(batch['id'],items,before_commit=finish)
     else:
@@ -751,29 +878,45 @@ async def _advance(database,*,include_recent=False,runner=None,retry_repair=Fals
 
 async def transcribe_component(database,batch,component,index,runner,*,key_prefix='image_transcription'):
     """Use exact cached rows first, then the separately assigned image model."""
-    from ..image_transcription import cached_transcriptions, mark_transcription, persist_transcriptions
-    probe=request_for(database,batch,'event_curator',component=component,transcription_only=True)
+    from ..image_transcription import reusable_transcriptions, mark_transcription, persist_transcriptions, PROMPT
+    probe=await asyncio.to_thread(request_for,database,batch,'event_curator',component=component,transcription_only=True)
     images=probe.get('images',[])
-    cached=cached_transcriptions(component['context_messages'],images)
+    cached=reusable_transcriptions(database,component['context_messages'],images)
     if len(cached)==len(images):
         component['curator_image_transcriptions']=cached
         return bool(images)
     if not images or not snapshot(database,batch['id'])['models'].get('image_transcription'):
         return False
     message_ids=[item['source_message_id'] for item in images]
-    mark_transcription(database,message_ids,'pending')
-    try:
-        output=await job(database,batch,probe,f'{key_prefix}:{index}',runner)
-        bound=bind_transcriptions(output,images)
-        persist_transcriptions(database,bound)
-        component['curator_image_transcriptions']=bound
-        for message in component['context_messages']:
-            rows=[item for item in bound if item['source_message_id']==message['id']]
-            if rows:message['image_transcription']={'status':'complete','items':rows}
-        return True
-    except Exception as error:
-        mark_transcription(database,message_ids,'failed',error=type(error).__name__)
-        raise
+    mark_transcription(database,message_ids,'pending',images=images)
+    persist_transcriptions(database,cached)
+    by_key={(item['source_message_id'],item['position']):item for item in cached}
+    errors=[]
+    for image in images:
+        key=(image['source_message_id'],image['position'])
+        if key in by_key:continue
+        single={**probe,'images':[image], 'prompt':PROMPT+'\n本次只附一张图，input_image 必须为 1。'}
+        try:
+            output=await job(database,batch,single,
+                f"{key_prefix}:{index}:{key[0]}:{key[1]}:{image['sha256']}",runner)
+            bound=bind_transcriptions(output,[image])
+            persist_transcriptions(database,bound)
+            by_key[key]=bound[0]
+        except AwaitAgent:
+            raise  # Waiting for the configured agent is not a transcription failure.
+        except Exception as error:
+            mark_transcription(database,[key[0]],'failed',error=type(error).__name__)
+            errors.append((key[0],error))
+    if errors:
+        for message_id,error in errors:
+            mark_transcription(database,[message_id],'failed',error=type(error).__name__)
+        raise errors[0][1]
+    bound=[by_key[(image['source_message_id'],image['position'])] for image in images]
+    component['curator_image_transcriptions']=bound
+    for message in component['context_messages']:
+        rows=[item for item in bound if item['source_message_id']==message['id']]
+        if rows:message['image_transcription']={'status':'complete','items':rows}
+    return True
 
 
 def event_writer_concurrency(database,batch,runner):
@@ -845,9 +988,13 @@ async def _advance_frozen(database,*,include_recent=False,runner=None,retry_repa
                     components(database,data,routed,include_materials=False)):
                 raise RoutingRecoveryError('frozen components disagree with routing snapshot')
         for index,component in enumerate(data['components']):
+            if component.get('base_event_candidate_overflow'):
+                plans.append((component,overflow_plan(component),[]))
+                continue
             pretranscribed=await transcribe_component(database,batch,component,index,runner)
             request=request_for(database,batch,'event_curator',component=component,pretranscribed=pretranscribed)
-            with Store(database) as store:store.conn.execute('UPDATE pipeline_batches SET input_json=? WHERE id=?',(encode(data),batch['id']))
+            encoded_data=encode(data)
+            with Store(database) as store:store.conn.execute('UPDATE pipeline_batches SET input_json=? WHERE id=?',(encoded_data,batch['id']))
             output=await job(database,batch,request,f'event_curator:{index}',runner)
             component=request['component']
             if 'context_request' in output:
@@ -856,8 +1003,12 @@ async def _advance_frozen(database,*,include_recent=False,runner=None,retry_repa
                 request=request_for(database,batch,'event_curator',component=component,context_read=True,pretranscribed=pretranscribed)
                 output=await job(database,batch,request,f'event_curator:{index}:context',runner)
                 component=request['component']
-            if not pretranscribed:
+            # job() restores its frozen request on resume; use that contract,
+            # not the cache state computed before loading the saved task.
+            if not request.get('pretranscribed'):
                 component['curator_image_transcriptions']=bind_transcriptions(output,request.get('images',[]))
+                from ..image_transcription import persist_transcriptions
+                persist_transcriptions(database,component['curator_image_transcriptions'])
             plan=latest.normalize_event_curator_output(decision(output),component);event_results=[]
             first_results=await first_event_writer_pass(database,batch,component,plan,index,runner)
             # Any bounded context read remains serial: it can create shared image
@@ -872,6 +1023,8 @@ async def _advance_frozen(database,*,include_recent=False,runner=None,retry_repa
                             transcription=await job(database,batch,image_task,f'writer_context_images:{index}:{ordinal}',runner)
                             reading=image_task['component']
                             reading['curator_image_transcriptions']=bind_transcriptions(transcription,image_task['images'])
+                            from ..image_transcription import persist_transcriptions
+                            persist_transcriptions(database,reading['curator_image_transcriptions'])
                     request=request_for(database,batch,'event_writer',messages=owned,event=event,component=reading,context_read=True)
                     written=await job(database,batch,request,f'event_writer:{index}:{ordinal}:context',runner)
                 written={key:value for key,value in written.items() if key!='result_or_unfinished'}
@@ -909,7 +1062,7 @@ async def _flush_routes_frozen(database):
         upload=''
         if store.conn.execute("SELECT 1 FROM sqlite_master WHERE name='file_imports'").fetchone():
             upload=" AND (json_extract(r.metadata_json,'$.import_upload_id') IS NULL OR json_extract(r.metadata_json,'$.import_upload_id') IN (SELECT id FROM file_imports WHERE cursor=json_array_length(payload_json,'$.entries')))"
-        rows=[message(r) for r in store.conn.execute("SELECT r.* FROM raw_events r WHERE NOT EXISTS (SELECT 1 FROM pipeline_routes p WHERE p.raw_id=r.id) AND NOT EXISTS (SELECT 1 FROM raw_processing p WHERE p.raw_id=r.id)"+upload+' ORDER BY r.id')]
+        rows=[task_message(r) for r in store.conn.execute("SELECT r.* FROM raw_events r WHERE NOT EXISTS (SELECT 1 FROM pipeline_routes p WHERE p.raw_id=r.id) AND NOT EXISTS (SELECT 1 FROM raw_processing p WHERE p.raw_id=r.id)"+upload+' ORDER BY r.id')]
     sessions={}
     for row in rows:sessions.setdefault((row['source'],row['original_session_id']),[]).append(row)
     current=datetime.now(timezone.utc)
@@ -919,8 +1072,9 @@ async def _flush_routes_frozen(database):
         messages=[row for unit in units for row in unit];scope=digest(encode([source,session]))[:20]
         with Store(database) as store:
             with latest.identity_scope(identity(database)):
-                tracks,ordinal=track_state.load_tracks(store,source,session,messages[0]['id'],message)
-            recent=[message(r) for r in store.conn.execute('SELECT * FROM raw_events WHERE source=? AND session_id=? AND id<? ORDER BY id DESC LIMIT 6',(source,session,messages[0]['id']))][::-1]
+                tracks,ordinal=track_state.load_tracks(store,source,session,messages[0]['id'],task_message,
+                                                       lookback_days=config['policy'].get('track_lookback_days',3))
+            recent=[task_message(r) for r in store.conn.execute('SELECT * FROM raw_events WHERE source=? AND session_id=? AND id<? ORDER BY id DESC LIMIT 6',(source,session,messages[0]['id']))][::-1]
             data={'contract':CONTRACT,'routing_messages':messages,'tracks':tracks,'next_track_ordinal':ordinal,'scope':scope,'recent':recent,'day':current.astimezone(TZ).date().isoformat()}
             key='route:'+digest(encode(data));batch={'id':key,'input_json':encode(data)}
             store.conn.execute("INSERT OR IGNORE INTO pipeline_batches(id,scope,input_json,status) VALUES (?,?,?,'routing_only')",(key,scope,batch['input_json']))

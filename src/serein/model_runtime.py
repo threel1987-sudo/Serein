@@ -15,14 +15,7 @@ logger = logging.getLogger(__name__)
 
 class UpstreamError(ValueError):
     def __init__(self, response):
-        message = f'Upstream returned HTTP {response.status_code}'
-        try:
-            detail = response.text.strip()
-        except Exception:
-            detail = ''
-        if detail:
-            message += ': ' + detail[:300]
-        super().__init__(message)
+        super().__init__(f'Upstream returned HTTP {response.status_code}')
         self.response = response
 
 
