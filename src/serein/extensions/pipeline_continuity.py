@@ -7,9 +7,21 @@ MAX_CHARACTERS = 120_000
 
 
 def validate_bridge_owners(output, component, review=None):
-    """Require an explicit source-backed decision before leaving a bridge one-sided."""
+    """Single-sided bridge ownership is itself the ownership decision.
+
+    A declared bridge only joins the review; it never forces both Tracks to
+    bind the unit. When exactly one side's Event owns the complete bridge
+    unit, the other side is implicitly excluded. bridge_exclusions rows are
+    optional documentation and are still verified against the originals.
+    """
     units = {int(unit['unit_root_message_id']): unit
              for unit in component.get('memberships') or []}
+    skip_ids = set(output.get('skip_source_message_ids') or [])
+    defer_ids = set(output.get('defer_source_message_ids') or [])
+    stable_ids = {int(message['id']) for message in component.get('messages') or []}
+    # Pre-calculate valid bridge pairs so exclusions can be validated even
+    # when they document an already-implied exclusion.
+    bridge_tracks: dict[int, set[str]] = {}
     missing = set()
     for edge in component.get('context_edges') or []:
         root = int(edge['unit_root_message_id'])
@@ -23,11 +35,20 @@ def validate_bridge_owners(output, component, review=None):
         if {event['primary_track_id'] for event in events} != tracks:
             continue
         sources = set(unit.get('source_message_ids') or [root])
+        # Context-only bridges are reading material, not settlement scope;
+        # skipped or deferred bridge units need no ownership decision.
+        if (not sources.intersection(stable_ids)
+                or sources.issubset(skip_ids) or sources.issubset(defer_ids)):
+            continue
+        bridge_tracks[root] = tracks
         owners = {event['primary_track_id'] for event in events
                   if sources.issubset({binding['source_message_id']
                                        for binding in event['source_bindings']})}
-        if owners:
-            missing.update((root, track) for track in tracks - owners)
+        if len(owners) == 0:
+            # Neither side owns the complete unit; both sides must be accounted for.
+            missing.update((root, track) for track in tracks)
+        # len(owners) == 1: single-sided ownership implies the other side is excluded.
+        # len(owners) == 2: shared ownership, no exclusion needed.
     if review is not None and not isinstance(review, dict):
         raise ValueError('Curator decision_review must be an object')
     exclusions = (review or {}).get('bridge_exclusions', [])
@@ -41,7 +62,8 @@ def validate_bridge_owners(output, component, review=None):
             raise ValueError('Invalid bridge_exclusions fields')
         root, track = row['unit_root_message_id'], row['excluded_track_id']
         if (type(root) is not int or not isinstance(track, str)
-                or (root, track) not in missing or (root, track) in seen):
+                or root not in bridge_tracks or track not in bridge_tracks[root]
+                or (root, track) in seen):
             raise ValueError('Bridge exclusion must identify one missing side exactly once')
         if not isinstance(row['reason'], str) or not row['reason'].strip():
             raise ValueError('Bridge exclusion needs a grounded reason')
@@ -59,7 +81,7 @@ def validate_bridge_owners(output, component, review=None):
                     or quote not in str(messages[source_id].get('content') or '')):
                 raise ValueError('Bridge exclusion evidence must be verbatim in its unit')
         seen.add((root, track))
-    if seen != missing:
+    if missing and not missing.issubset(seen):
         raise ValueError('Missing bridge ownership decision for ' + str(sorted(missing - seen)))
 
 

@@ -61,7 +61,7 @@ def test_unbridged_and_oversized_components_remain_separate():
     assert len(bounded_components([one, two])) == 2
 
 
-def test_bridge_owner_is_explicit_or_excluded_with_verbatim_evidence():
+def test_single_sided_bridge_ownership_needs_no_exclusion():
     messages = [
         {'id': 1, 'track_id': 'a', 'session_id': 1, 'role': 'user',
          'content': 'Compare the two notebook covers.', 'created_at': '2026-01-01T00:00:00Z'},
@@ -76,12 +76,13 @@ def test_bridge_owner_is_explicit_or_excluded_with_verbatim_evidence():
         {'primary_track_id': 'a', 'source_bindings': [{'source_message_id': 1}]},
         {'primary_track_id': 'b', 'source_bindings': [
             {'source_message_id': 2}, {'source_message_id': 3}]},
-    ]}
-    with pytest.raises(ValueError, match='Missing bridge ownership decision'):
-        validate_bridge_owners(output, component)
+    ], 'skip_source_message_ids': [], 'defer_source_message_ids': []}
+    # Single-sided ownership is enough; no explicit bridge_exclusion required.
+    validate_bridge_owners(output, component)
     exclusion = {'unit_root_message_id': 2, 'excluded_track_id': 'a',
                  'reason': 'The label starts a separate activity',
                  'evidence': [{'source_message_id': 2, 'quote': 'sketch a label'}]}
+    # Optional explicit exclusion is still accepted and verified.
     validate_bridge_owners(output, component, {'bridge_exclusions': [exclusion]})
     invented = copy.deepcopy(exclusion)
     invented['evidence'][0]['quote'] = 'not in the original'
@@ -113,8 +114,10 @@ def test_compact_curator_does_not_add_a_second_bridge_owner():
                                             'evidence': [{'source_message_id': 1, 'quote': 'Compare the covers'},
                                                          {'source_message_id': 3, 'quote': 'label can be blue'}]}],
                             'dispositions': [], 'continuations': []}}
-    with pytest.raises(ValueError, match='Missing bridge ownership decision'):
-        normalize_event_curator_output(proposal, component)
+    # Single-sided bridge ownership is the decision; no exclusion is required.
+    plan = normalize_event_curator_output(proposal, component)
+    assert plan['events'][0]['source_message_ids'] == [1]
+    assert plan['events'][1]['source_message_ids'] == [2, 3]
     proposal['decision_review']['bridge_exclusions'] = [{
         'unit_root_message_id': 2, 'excluded_track_id': 'a',
         'reason': 'The message only opens label design',
