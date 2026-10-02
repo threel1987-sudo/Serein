@@ -29,7 +29,7 @@
 - Track primary routing 只负责唯一 accounting。Event 可以重叠，但只能共同选择 Router 已声明的 bridge unit；普通 unit 不得重复归属。
 - 用户或 {ai_name} 的一枚回复可以落定前线并开启后线；前后 Event 可以共同选择完整的 declared bridge unit，但两条 Event 都还应有自己的实际问题、回答、行动或结果，不能只靠 bridge 成立。
 - 若同一枚 unit 明确回答、拒绝、纠正或落定前一活动，又发起得到接续的新活动，前后两条 Event 都应显式选择完整 bridge；host 不自动增加第二个 owner。
-- Router 的 bridge 是共同审阅线索，不强制两侧 Event 都绑定。若某侧只共享对象或背景、没有参与该侧活动，可在 decision_review.bridge_exclusions 写明 unit_root_message_id、excluded_track_id、具体理由及 bridge unit 内逐字 evidence；没有排除项时可省略。不能用排除项丢掉实际回应或收尾。
+- Router 的 bridge 是共同审阅线索，不强制两侧 Event 都绑定。bridge unit 只能完整归属：两侧共有、仅一侧拥有（另一侧自动视为排除），或整枚 skip/defer。若某侧只共享对象或背景、没有参与该侧活动，可在 decision_review.bridge_exclusions 写明 unit_root_message_id、excluded_track_id、具体理由及 bridge unit 内逐字 evidence 作为记录；没有排除项时可省略。不能用排除项丢掉实际回应或收尾。boundary 引文须来自左右各自独占的 owned 原文；共有的 bridge unit 不算独占。
 - create 不选 base；extend 必须选一个 base；merge 必须选至少两个 base。只选择 base_event_ids 与本轮 owned_unit_roots；host 自动计算“所有所选 base 的旧 sources + 本轮完整 units”的 exact union。
 - 在 rolling_engineering Track 中，必须逐条阅读 active leaf 绑定的原文，而不能用 leaf 数量代替相关性判断。base 与新原文都服务同一 Track throughline 才是相关材料；选择全部相关 leaves：一条用 extend，多条用 merge。关系互动、作品讨论或其他误归线 leaf 保持未选择；即使它是唯一 active leaf，也允许为真正的新工程经历 create。
 - protected、manual、forked、blocked、scene_ref 或 narrative_ref 的旧正文不能被自动重写。若新原文确实接续，仍按实际关系提出带 base_event_ids 和 owned_unit_roots 的 Event；host 只在明确启用且来源版本唯一、可核验时将新段落追加成新版本，其他情况暂缓。不得用 skip 绕过保护，也不要因为保护而把独立的新活动强行写成接续。
