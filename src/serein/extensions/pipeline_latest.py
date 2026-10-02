@@ -157,6 +157,10 @@ def build_event_track_curator_prompt(date_view: str, component: dict[str, Any], 
         format_hint['decision_review']['events'][0]['admission'] = {'closed_by': None}
     material_rule = ('decision_review.events 每项增加 materials，按该 Event 的全部 owned source_message_id 逐条标记 '
                      '{"source_message_id":1,"use":"main|background|omit|mixed","reason":"依据","omit_quotes":[]}。'
+                     '注意：extend/merge 的 owned 是“所选 base 的全部旧 source＋本轮 owned units”的并集，'
+                     'base 的旧 source（见 base_events 的 messages）也必须各标一条；每条 source 恰好出现一次。'
+                     'materials 和 admission 只写在 decision_review.events 内；顶层 events 对象只允许 '
+                     'action、base_event_ids、primary_track_id、owned_unit_roots 四个字段，多写直接报错。'
                      'main 是实际起因、推进、结果或必要回应；background 是必需前提；omit 是无关旁支；'
                      'mixed 保留主内容，并用逐字 omit_quotes 标出省略片段。main/background 的 omit_quotes 为空，'
                      'mixed 必须有省略片段；不可遗漏或重复 owned 来源。只决定本 Event 的写作用途，不改变 ownership。'
@@ -239,9 +243,13 @@ def _expand_compact_event_curator_output(output: dict[str, Any], component: dict
     skip_roots = unit_roots(raw_skip, 'skip')
     defer_roots = unit_roots(raw_defer, 'defer')
     compact_events: list[dict[str, Any]] = []
+    compact_event_fields = {'action', 'base_event_ids', 'primary_track_id', 'owned_unit_roots'}
     for raw_event in raw_events:
-        if not isinstance(raw_event, dict) or set(raw_event) != {'action', 'base_event_ids', 'primary_track_id', 'owned_unit_roots'}:
-            raise ValueError('Track Curator compact Event has invalid fields')
+        if not isinstance(raw_event, dict) or set(raw_event) != compact_event_fields:
+            got = sorted(raw_event) if isinstance(raw_event, dict) else raw_event
+            raise ValueError('Track Curator compact Event has invalid fields: expected exactly '
+                             + str(sorted(compact_event_fields)) + ', got ' + str(got)
+                             + '; materials/admission 只写在 decision_review.events 内')
         owned_roots = unit_roots(raw_event.get('owned_unit_roots'), 'ownership')
         if not owned_roots:
             raise ValueError('Track Curator compact Event needs an owned unit')

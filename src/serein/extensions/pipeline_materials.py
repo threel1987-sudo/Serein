@@ -23,8 +23,10 @@ def attach(review, output, plan, component):
             if not isinstance(item, dict) or set(item) != {'source_message_id', 'use', 'reason', 'omit_quotes'}:
                 raise ValueError('Invalid Curator material fields')
             source_id, use, quotes = item['source_message_id'], item['use'], item['omit_quotes']
-            if type(source_id) is not int or source_id not in owned or source_id in seen:
-                raise ValueError('Materials must exactly cover owned sources once')
+            if type(source_id) is not int or source_id not in owned:
+                raise ValueError(f'Materials must exactly cover owned sources once: unexpected source {source_id}')
+            if source_id in seen:
+                raise ValueError(f'Materials must exactly cover owned sources once: repeated source {source_id}')
             seen.add(source_id)
             if use not in USES or not isinstance(item['reason'], str) or not item['reason'].strip():
                 raise ValueError('Invalid material use or reason')
@@ -40,7 +42,8 @@ def attach(review, output, plan, component):
                 if not remaining.strip():
                     raise ValueError('Mixed source must retain content')
         if seen != owned:
-            raise ValueError('Materials must exactly cover owned sources once')
+            raise ValueError('Materials must exactly cover owned sources once: missing '
+                             + str(sorted(owned - seen)))
         if event['event_ref'] in accepted:
             accepted[event['event_ref']]['source_materials'] = materials
 
