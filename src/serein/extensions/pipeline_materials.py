@@ -43,7 +43,9 @@ def attach(review, output, plan, component):
                     raise ValueError('Mixed source must retain content')
         if seen != owned:
             raise ValueError('Materials must exactly cover owned sources once: missing '
-                             + str(sorted(owned - seen)))
+                             + str(sorted(owned - seen))
+                             + '；owned unit 会展开为其全部成员消息，extend/merge 还会并入 base 旧 source，'
+                               '每一条 owned source 都要在 materials 各写一条，不是只写 unit root')
         if event['event_ref'] in accepted:
             accepted[event['event_ref']]['source_materials'] = materials
 

@@ -236,9 +236,18 @@ def _expand_compact_event_curator_output(output: dict[str, Any], component: dict
     def unit_roots(values: list[Any], label: str) -> list[int]:
         roots: list[int] = []
         for value in values:
-            if type(value) is not int or value not in membership_by_root or value in roots:
-                raise ValueError(f'Track Curator {label} contains an invalid unit root')
-            roots.append(value)
+            if type(value) is int and value in membership_by_root and value not in roots:
+                roots.append(value)
+                continue
+            if type(value) is int and value in roots:
+                hint = '；unit root 不可重复'
+            else:
+                owner = next((root for root, membership in membership_by_root.items()
+                              if type(value) is int and value in (membership.get('source_message_ids') or [root])), None)
+                hint = (f'；{value} 是 unit {owner} 的成员消息，归属 root {owner} 即自动覆盖它，请改填 {owner}'
+                        if owner is not None else
+                        '；只能填 memberships 里的 unit_root_message_id（见 allowed_ids.stable_unit_roots），unit 的成员消息 id 不是 root')
+            raise ValueError(f'Track Curator {label} contains an invalid unit root: {value}{hint}')
         return roots
     skip_roots = unit_roots(raw_skip, 'skip')
     defer_roots = unit_roots(raw_defer, 'defer')
